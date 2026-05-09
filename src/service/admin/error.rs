@@ -4,6 +4,7 @@ use std::fmt;
 
 use axum::http::StatusCode;
 
+use crate::domain::error::{ConfigError, RefreshError};
 use crate::interface::http::admin::dto::AdminErrorResponse;
 use crate::service::credential_pool::AdminPoolError;
 
@@ -16,14 +17,20 @@ pub enum AdminServiceError {
     /// 凭据不存在
     NotFound { id: u64 },
 
-    /// 上游服务调用失败（Token 刷新 / 网络错误）
+    /// 上游服务调用失败（网络等字符串错误）
     UpstreamError(String),
+
+    /// Token 刷新失败（保留结构化 RefreshError）
+    RefreshError(RefreshError),
 
     /// 上游 HTTP 非 2xx 响应
     UpstreamHttp { status: u16, body: String },
 
-    /// 内部状态错误（配置持久化等）
+    /// 内部状态错误（通用字符串错误）
     InternalError(String),
+
+    /// 配置持久化失败（保留结构化 ConfigError）
+    ConfigError(ConfigError),
 
     /// 凭据因配置无效被禁用
     DisabledByInvalidConfig(u64),
@@ -64,10 +71,12 @@ impl fmt::Display for AdminServiceError {
         match self {
             AdminServiceError::NotFound { id } => write!(f, "凭据不存在: {id}"),
             AdminServiceError::UpstreamError(msg) => write!(f, "上游服务错误: {msg}"),
+            AdminServiceError::RefreshError(e) => write!(f, "Token 刷新失败: {e}"),
             AdminServiceError::UpstreamHttp { status, body } => {
                 write!(f, "上游 HTTP {status}: {body}")
             }
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {msg}"),
+            AdminServiceError::ConfigError(e) => write!(f, "配置持久化失败: {e}"),
             AdminServiceError::DisabledByInvalidConfig(id) => {
                 write!(
                     f,
@@ -109,10 +118,13 @@ impl AdminServiceError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             AdminServiceError::NotFound { .. } => StatusCode::NOT_FOUND,
-            AdminServiceError::UpstreamError(_) | AdminServiceError::UpstreamHttp { .. } => {
+            AdminServiceError::UpstreamError(_)
+            | AdminServiceError::RefreshError(_)
+            | AdminServiceError::UpstreamHttp { .. } => {
                 StatusCode::BAD_GATEWAY
             }
             AdminServiceError::InternalError(_)
+            | AdminServiceError::ConfigError(_)
             | AdminServiceError::DisabledByInvalidConfig(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::DuplicateRefreshToken
             | AdminServiceError::DuplicateApiKey
@@ -135,8 +147,10 @@ impl AdminServiceError {
         let error_type = match &self {
             AdminServiceError::NotFound { .. } => "not_found",
             AdminServiceError::UpstreamError(_) => "upstream_error",
+            AdminServiceError::RefreshError(_) => "refresh_error",
             AdminServiceError::UpstreamHttp { .. } => "upstream_http_error",
             AdminServiceError::InternalError(_) => "internal_error",
+            AdminServiceError::ConfigError(_) => "config_error",
             AdminServiceError::DisabledByInvalidConfig(_) => "disabled_by_invalid_config",
             AdminServiceError::DuplicateRefreshToken => "duplicate_refresh_token",
             AdminServiceError::DuplicateApiKey => "duplicate_api_key",
@@ -169,12 +183,12 @@ impl From<AdminPoolError> for AdminServiceError {
             AdminPoolError::MissingApiKey => AdminServiceError::MissingApiKey,
             AdminPoolError::NotDisabled(id) => AdminServiceError::NotDisabled(id),
             AdminPoolError::ApiKeyNotRefreshable => AdminServiceError::ApiKeyNotRefreshable,
-            AdminPoolError::Refresh(e) => AdminServiceError::UpstreamError(e.to_string()),
+            AdminPoolError::Refresh(e) => AdminServiceError::RefreshError(e),
             AdminPoolError::UpstreamHttp { status, body } => {
                 AdminServiceError::UpstreamHttp { status, body }
             }
             AdminPoolError::Network(e) => AdminServiceError::UpstreamError(e),
-            AdminPoolError::Config(e) => AdminServiceError::InternalError(e.to_string()),
+            AdminPoolError::Config(e) => AdminServiceError::ConfigError(e),
             AdminPoolError::DisabledByInvalidConfig(id) => {
                 AdminServiceError::DisabledByInvalidConfig(id)
             }

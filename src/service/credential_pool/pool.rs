@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 use crate::domain::credential::Credential;
-use crate::domain::error::{ProviderError, RefreshError};
+use crate::domain::error::{ConfigError, KiroError, ProviderError, RefreshError};
 use crate::domain::retry::DisabledReason;
 use crate::domain::selector::{
     CredentialSelector, CredentialStateView, CredentialStatsView, CredentialView,
@@ -161,13 +161,13 @@ impl CredentialPool {
     /// 持锁完成"读 → 写 → 持久化 → 失败回滚"全过程，避免双 lock 期间的中间态泄漏。
     /// 持锁期间会做磁盘 I/O（Config::load + Config::save），但 admin 写路径调用频率低，
     /// 与 get_load_balancing_mode 的读冲突可忽略。
-    pub fn set_load_balancing_mode(&self, mode: &str) -> Result<(), ProviderError> {
+    pub fn set_load_balancing_mode(&self, mode: &str) -> Result<(), KiroError> {
         let normalized = match mode {
             MODE_PRIORITY | MODE_BALANCED => mode.to_string(),
             other => {
-                return Err(ProviderError::BadRequest(format!(
+                return Err(KiroError::Provider(ProviderError::BadRequest(format!(
                     "unknown load balancing mode: {other}"
-                )));
+                ))));
             }
         };
 
@@ -179,9 +179,7 @@ impl CredentialPool {
 
         if let Err(e) = self.persist_load_balancing_mode(&normalized) {
             *guard = previous;
-            return Err(ProviderError::BadRequest(format!(
-                "持久化负载均衡模式失败: {e}"
-            )));
+            return Err(KiroError::Config(e));
         }
         Ok(())
     }
@@ -1663,7 +1661,7 @@ mod tests {
 
         // persist 必失败 → 应回滚到 priority
         let err = pool.set_load_balancing_mode(MODE_BALANCED).unwrap_err();
-        assert!(matches!(err, ProviderError::BadRequest(_)));
+        assert!(matches!(err, KiroError::Config(_)));
         assert_eq!(
             pool.get_load_balancing_mode(),
             MODE_PRIORITY,

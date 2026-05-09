@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::domain::credential::Credential;
+use crate::domain::error::KiroError;
 use crate::infra::storage::BalanceCacheStore;
 use crate::service::credential_pool::CredentialPool;
 
@@ -234,7 +235,10 @@ impl AdminService {
         }
         self.pool
             .set_load_balancing_mode(&req.mode)
-            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+            .map_err(|e| match e {
+                KiroError::Config(e) => AdminServiceError::ConfigError(e),
+                other => AdminServiceError::InvalidRequest(other.to_string()),
+            })?;
         Ok(LoadBalancingModeResponse { mode: req.mode })
     }
 
