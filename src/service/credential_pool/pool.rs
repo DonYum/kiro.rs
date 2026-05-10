@@ -601,6 +601,9 @@ impl CredentialPool {
             return Err(AdminPoolError::NotFound(id));
         }
         self.state.set_disabled(id, disabled);
+        if disabled {
+            self.refresh_locks.lock().remove(&id);
+        }
         Ok(())
     }
 
