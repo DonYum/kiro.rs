@@ -186,8 +186,19 @@ impl CredentialStore {
         Ok(true)
     }
 
-    /// 写回所有字段（用于 token 刷新后更新 access_token / expires_at / refresh_token / profile_arn）
-    pub fn replace(&self, id: u64, new_cred: Credential) -> Result<bool, ConfigError> {
+    /// 将候选快照保存到磁盘（仅多格式），按 priority 排序。
+    fn save_candidate(&self, mut creds: Vec<Credential>) -> Result<bool, ConfigError> {
+        if !self.is_multiple {
+            return Ok(false);
+        }
+        creds.sort_by_key(|c| c.priority);
+        self.file.save(&creds, true)
+    }
+
+    /// Best-effort 写回：先更新内存再持久化；磁盘失败时内存仍保留新值。
+    ///
+    /// 用于请求路径（token 刷新）：刷新成功但磁盘抖动时，内存更新让请求继续。
+    pub fn replace_best_effort(&self, id: u64, new_cred: Credential) -> Result<bool, ConfigError> {
         let mut map = self.inner.lock();
         if !map.contains_key(&id) {
             return Ok(false);
@@ -198,39 +209,53 @@ impl CredentialStore {
         Ok(true)
     }
 
-    pub fn set_priority(&self, id: u64, priority: u32) -> Result<bool, ConfigError> {
-        let updated = {
-            let mut map = self.inner.lock();
-            match map.get_mut(&id) {
-                Some(c) => {
-                    c.priority = priority;
-                    true
-                }
-                None => false,
-            }
-        };
-        if updated {
-            self.persist()?;
+    /// 严格持久化：先写盘，成功后才更新内存。
+    ///
+    /// 用于 admin 显式写路径：API 返回失败时调用方不应观察到部分成功。
+    pub fn replace_persisted(&self, id: u64, new_cred: Credential) -> Result<bool, ConfigError> {
+        let mut map = self.inner.lock();
+        if !map.contains_key(&id) {
+            return Ok(false);
         }
-        Ok(updated)
+        let mut candidate = map.clone();
+        candidate.insert(id, new_cred.clone());
+        self.save_candidate(candidate.into_values().collect())?;
+        map.insert(id, new_cred);
+        Ok(true)
     }
 
-    /// 同步 disabled 字段到文件并回写（仅多格式）
-    pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<bool, ConfigError> {
-        let updated = {
-            let mut map = self.inner.lock();
-            match map.get_mut(&id) {
-                Some(c) => {
-                    c.disabled = disabled;
-                    true
-                }
-                None => false,
-            }
-        };
-        if updated {
-            self.persist()?;
+    /// 设置 priority：先写盘，成功后才更新内存。
+    pub fn set_priority(&self, id: u64, priority: u32) -> Result<bool, ConfigError> {
+        let mut map = self.inner.lock();
+        if !map.contains_key(&id) {
+            return Ok(false);
         }
-        Ok(updated)
+        let mut candidate = map.clone();
+        if let Some(c) = candidate.get_mut(&id) {
+            c.priority = priority;
+        }
+        self.save_candidate(candidate.into_values().collect())?;
+        if let Some(c) = map.get_mut(&id) {
+            c.priority = priority;
+        }
+        Ok(true)
+    }
+
+    /// 设置 disabled：先写盘，成功后才更新内存。
+    pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<bool, ConfigError> {
+        let mut map = self.inner.lock();
+        if !map.contains_key(&id) {
+            return Ok(false);
+        }
+        let mut candidate = map.clone();
+        if let Some(c) = candidate.get_mut(&id) {
+            c.disabled = disabled;
+        }
+        self.save_candidate(candidate.into_values().collect())?;
+        if let Some(c) = map.get_mut(&id) {
+            c.disabled = disabled;
+        }
+        Ok(true)
     }
 
     fn persist(&self) -> Result<bool, ConfigError> {
@@ -417,5 +442,103 @@ mod tests {
         let (store, _) = res.expect("auto-assigned ids should not be flagged duplicate");
         assert_eq!(store.count(), 2);
         let _ = fs::remove_file(&path);
+    }
+
+    /// 构造 store，凭据文件在可删除的子目录中；返回 (store, 子目录路径)。
+    /// 删除子目录后 CredentialsFileStore::save 会因父目录不存在而失败。
+    fn make_store_with_deletable_dir(
+        content: &str,
+        tag: &str,
+    ) -> (CredentialStore, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-rs-store-rm-{}-{}",
+            tag,
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("creds.json");
+        fs::write(&path, content).unwrap();
+        let file = Arc::new(CredentialsFileStore::new(Some(path)));
+        let config = Arc::new(Config::default());
+        let resolver = Arc::new(MachineIdResolver::new());
+        let (store, _) = CredentialStore::load(file, config, resolver).unwrap();
+        (store, dir)
+    }
+
+    #[test]
+    fn set_priority_persist_failure_does_not_modify_memory() {
+        let (store, dir) =
+            make_store_with_deletable_dir(FIXTURE_ARRAY_MIXED, "priority-rollback");
+        let id = store.ids()[0];
+        let old_priority = store.get(id).unwrap().priority;
+
+        // 删除目录使后续 save 失败
+        fs::remove_dir_all(&dir).unwrap();
+
+        let err = store.set_priority(id, 999).unwrap_err();
+        assert!(matches!(err, ConfigError::Io(_)));
+        assert_eq!(
+            store.get(id).unwrap().priority,
+            old_priority,
+            "持久化失败后 priority 应保持旧值"
+        );
+    }
+
+    #[test]
+    fn set_disabled_persist_failure_does_not_modify_memory() {
+        let (store, dir) =
+            make_store_with_deletable_dir(FIXTURE_ARRAY_MIXED, "disabled-rollback");
+        let id = store.ids()[0];
+        assert!(!store.get(id).unwrap().disabled);
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        let err = store.set_disabled(id, true).unwrap_err();
+        assert!(matches!(err, ConfigError::Io(_)));
+        assert!(
+            !store.get(id).unwrap().disabled,
+            "持久化失败后 disabled 应保持 false"
+        );
+    }
+
+    #[test]
+    fn replace_persisted_persist_failure_does_not_modify_memory() {
+        let (store, dir) =
+            make_store_with_deletable_dir(FIXTURE_ARRAY_MIXED, "replace-persisted-rollback");
+        let id = store.ids()[0];
+        let old_cred = store.get(id).unwrap();
+        let old_token = old_cred.access_token.clone();
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        let mut new_cred = old_cred;
+        new_cred.access_token = Some("new-token".to_string());
+        let err = store.replace_persisted(id, new_cred).unwrap_err();
+        assert!(matches!(err, ConfigError::Io(_)));
+        assert_eq!(
+            store.get(id).unwrap().access_token,
+            old_token,
+            "持久化失败后 access_token 应保持旧值"
+        );
+    }
+
+    #[test]
+    fn replace_best_effort_persist_failure_still_modifies_memory() {
+        let (store, dir) =
+            make_store_with_deletable_dir(FIXTURE_ARRAY_MIXED, "replace-best-effort");
+        let id = store.ids()[0];
+        let old_cred = store.get(id).unwrap();
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        let mut new_cred = old_cred;
+        new_cred.access_token = Some("new-token".to_string());
+        let err = store.replace_best_effort(id, new_cred).unwrap_err();
+        assert!(matches!(err, ConfigError::Io(_)));
+        assert_eq!(
+            store.get(id).unwrap().access_token.as_deref(),
+            Some("new-token"),
+            "best-effort 语义：磁盘失败但内存已更新"
+        );
     }
 }

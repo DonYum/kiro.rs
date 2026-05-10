@@ -388,7 +388,7 @@ impl CredentialPool {
         // 写回 store；持久化失败仅 log，请求路径不因磁盘抖动失败
         let mut updated = fresh;
         updated.apply_refresh(&outcome);
-        match self.store.replace(id, updated.clone()) {
+        match self.store.replace_best_effort(id, updated.clone()) {
             Ok(true) => {}
             Ok(false) => {
                 tracing::warn!(id, "刷新成功但凭据已被删除，token 仅本次请求有效");
@@ -471,7 +471,7 @@ impl CredentialPool {
         }?;
         let mut updated = fresh;
         updated.apply_refresh(&outcome);
-        match self.store.replace(id, updated) {
+        match self.store.replace_best_effort(id, updated) {
             Ok(true) => {}
             Ok(false) => {
                 tracing::warn!(id, "刷新成功但凭据已被删除，token 仅本次请求有效");
@@ -807,7 +807,7 @@ impl CredentialPool {
         let mut updated = fresh;
         updated.apply_refresh(&outcome);
         // admin 路径：持久化失败应反馈给调用方
-        let _ = self.store.replace(id, updated)?;
+        let _ = self.store.replace_persisted(id, updated)?;
         self.state.report_success(id);
         tracing::info!("凭据 #{} Token 已强制刷新", id);
         Ok(())
@@ -828,7 +828,7 @@ impl CredentialPool {
         {
             let mut updated = fresh_cred.clone();
             updated.subscription_title = Some(title.to_string());
-            let _ = self.store.replace(id, updated);
+            let _ = self.store.replace_best_effort(id, updated);
         }
         Ok(usage)
     }
@@ -867,7 +867,7 @@ impl CredentialPool {
         }?;
         let mut updated = fresh;
         updated.apply_refresh(&outcome);
-        match self.store.replace(id, updated.clone()) {
+        match self.store.replace_best_effort(id, updated.clone()) {
             Ok(true) => {}
             Ok(false) => {
                 tracing::warn!(id, "刷新成功但凭据已被删除，token 仅本次请求有效");
@@ -1864,5 +1864,99 @@ mod tests {
             ..Default::default()
         };
         assert!(!is_token_expiring_soon(&cred_bad));
+    }
+
+    /// 构造 pool，凭据文件在可删除的子目录中；返回 (pool, 子目录路径)。
+    fn pool_with_deletable_dir(n: usize, mode: &str) -> (CredentialPool, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-rs-pool-rm-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let creds_path = dir.join("creds.json");
+        let mut creds_json = Vec::new();
+        for i in 0..n {
+            creds_json.push(serde_json::json!({
+                "refreshToken": format!("rt-{i}"),
+                "accessToken": format!("at-{i}"),
+                "expiresAt": far_future_expires_at(),
+                "authMethod": "social",
+                "priority": i,
+            }));
+        }
+        let arr = serde_json::Value::Array(creds_json);
+        fs::write(&creds_path, serde_json::to_string_pretty(&arr).unwrap()).unwrap();
+
+        let file = Arc::new(CredentialsFileStore::new(Some(creds_path)));
+        let mut config = Config::default();
+        config.features.load_balancing_mode = mode.to_string();
+        let config = Arc::new(config);
+        let resolver = Arc::new(MachineIdResolver::new());
+        let (store, _) = CredentialStore::load(file, config.clone(), resolver.clone()).unwrap();
+        let store = Arc::new(store);
+        let state = Arc::new(CredentialState::new());
+        let stats = Arc::new(CredentialStats::new());
+        let pool = CredentialPool::new(store, state, stats, None, config, resolver);
+        let invalid: HashSet<u64> = HashSet::new();
+        let initial_disabled: HashSet<u64> = HashSet::new();
+        pool.install_initial_states(&invalid, &initial_disabled);
+        (pool, dir)
+    }
+
+    #[test]
+    fn pool_set_disabled_persist_failure_returns_error_and_preserves_state() {
+        let (pool, dir) = pool_with_deletable_dir(2, MODE_PRIORITY);
+        let id = pool.store.ids()[0];
+
+        // 初始状态：enabled
+        assert!(!pool.store.get(id).unwrap().disabled);
+        assert!(!pool.state.get(id).unwrap().disabled);
+
+        // 删除目录使持久化失败
+        fs::remove_dir_all(&dir).unwrap();
+
+        let err = pool.set_disabled(id, true).unwrap_err();
+        assert!(matches!(err, AdminPoolError::Config(_)));
+
+        // store 和 state 都应保持旧值
+        assert!(
+            !pool.store.get(id).unwrap().disabled,
+            "store.disabled 应保持 false"
+        );
+        assert!(
+            !pool.state.get(id).unwrap().disabled,
+            "state.disabled 应保持 false"
+        );
+    }
+
+    #[test]
+    fn pool_reset_and_enable_persist_failure_returns_error_and_preserves_state() {
+        let (pool, dir) = pool_with_deletable_dir(2, MODE_PRIORITY);
+        let id = pool.store.ids()[0];
+
+        // 先手动在 state 中禁用（不走 store，避免持久化）
+        pool.state.set_disabled(id, true);
+        // store 也需要同步 disabled=true，否则 reset_and_enable 检查不一致
+        // 通过在删目录前先设置 store disabled
+        pool.store.set_disabled(id, true).unwrap();
+
+        assert!(pool.store.get(id).unwrap().disabled);
+        assert!(pool.state.get(id).unwrap().disabled);
+
+        // 删除目录使持久化失败
+        fs::remove_dir_all(&dir).unwrap();
+
+        let err = pool.reset_and_enable(id).unwrap_err();
+        assert!(matches!(err, AdminPoolError::Config(_)));
+
+        // store 和 state 都应保持 disabled=true
+        assert!(
+            pool.store.get(id).unwrap().disabled,
+            "store.disabled 应保持 true"
+        );
+        assert!(
+            pool.state.get(id).unwrap().disabled,
+            "state.disabled 应保持 true"
+        );
     }
 }
