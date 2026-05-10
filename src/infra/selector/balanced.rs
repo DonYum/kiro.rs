@@ -1,4 +1,4 @@
-//! 均衡选择器（Least-Used）：返回 success_count 最小的凭据；平局看 priority
+//! 均衡选择器（Least-Used）：返回 success_count 最小的凭据；平局看 priority，再平局看 id
 
 use crate::domain::selector::{CredentialSelector, CredentialView};
 
@@ -26,6 +26,7 @@ impl CredentialSelector for BalancedSelector {
                     .success_count
                     .cmp(&b.stats.success_count)
                     .then_with(|| a.credential.priority.cmp(&b.credential.priority))
+                    .then_with(|| a.id.cmp(&b.id))
             })
             .map(|v| v.id)
     }
@@ -98,6 +99,44 @@ mod tests {
         let candidates = vec![view(1, &c1, &s, &st), view(2, &c2, &s, &st)];
         // 同样 success_count → 比 priority → priority=1 更优
         assert_eq!(selector.select(&candidates, None), Some(2));
+    }
+
+    #[test]
+    fn select_with_tied_usage_and_priority_picks_lowest_id_regardless_of_input_order() {
+        let selector = BalancedSelector::new();
+        let c = Credential {
+            priority: 1,
+            ..Default::default()
+        };
+        let s = enabled();
+        let st = CredentialStatsView { success_count: 10 };
+
+        // success_count 和 priority 都相同时，必须按 id 兜底，避免 HashMap 迭代顺序影响选择。
+        let permutations = [
+            vec![
+                view(10, &c, &s, &st),
+                view(20, &c, &s, &st),
+                view(30, &c, &s, &st),
+            ],
+            vec![
+                view(30, &c, &s, &st),
+                view(10, &c, &s, &st),
+                view(20, &c, &s, &st),
+            ],
+            vec![
+                view(20, &c, &s, &st),
+                view(30, &c, &s, &st),
+                view(10, &c, &s, &st),
+            ],
+        ];
+
+        for candidates in permutations {
+            assert_eq!(
+                selector.select(&candidates, None),
+                Some(10),
+                "balanced 平局时应稳定选最低 id"
+            );
+        }
     }
 
     #[test]
