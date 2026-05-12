@@ -74,10 +74,7 @@ impl fmt::Display for AdminServiceError {
             }
             AdminServiceError::ConfigError(e) => write!(f, "配置持久化失败: {e}"),
             AdminServiceError::DisabledByInvalidConfig(id) => {
-                write!(
-                    f,
-                    "凭据 #{id} 因配置无效被禁用，请修正配置后重启服务"
-                )
+                write!(f, "凭据 #{id} 因配置无效被禁用，请修正配置后重启服务")
             }
             AdminServiceError::DuplicateRefreshToken => {
                 write!(f, "凭据已存在（refreshToken 重复）")
@@ -116,11 +113,10 @@ impl AdminServiceError {
             AdminServiceError::NotFound { .. } => StatusCode::NOT_FOUND,
             AdminServiceError::UpstreamError(_)
             | AdminServiceError::RefreshError(_)
-            | AdminServiceError::UpstreamHttp { .. } => {
-                StatusCode::BAD_GATEWAY
+            | AdminServiceError::UpstreamHttp { .. } => StatusCode::BAD_GATEWAY,
+            AdminServiceError::ConfigError(_) | AdminServiceError::DisabledByInvalidConfig(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
             }
-            AdminServiceError::ConfigError(_)
-            | AdminServiceError::DisabledByInvalidConfig(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::DuplicateRefreshToken
             | AdminServiceError::DuplicateApiKey
             | AdminServiceError::TruncatedRefreshToken(_)
@@ -266,7 +262,10 @@ mod tests {
     #[test]
     fn from_admin_pool_error_refresh_preserves_structure() {
         let e: AdminServiceError = AdminPoolError::Refresh(RefreshError::TokenInvalid).into();
-        assert!(matches!(e, AdminServiceError::RefreshError(RefreshError::TokenInvalid)));
+        assert!(matches!(
+            e,
+            AdminServiceError::RefreshError(RefreshError::TokenInvalid)
+        ));
     }
 
     #[test]
@@ -291,8 +290,7 @@ mod tests {
 
     #[test]
     fn from_admin_pool_error_network() {
-        let e: AdminServiceError =
-            AdminPoolError::Network("connection refused".into()).into();
+        let e: AdminServiceError = AdminPoolError::Network("connection refused".into()).into();
         assert!(matches!(e, AdminServiceError::UpstreamError(msg) if msg == "connection refused"));
     }
 
@@ -325,7 +323,11 @@ mod tests {
     #[test]
     fn status_code_upstream_http() {
         assert_eq!(
-            AdminServiceError::UpstreamHttp { status: 503, body: String::new() }.status_code(),
+            AdminServiceError::UpstreamHttp {
+                status: 503,
+                body: String::new()
+            }
+            .status_code(),
             StatusCode::BAD_GATEWAY
         );
     }
@@ -381,32 +383,33 @@ mod tests {
 
     #[test]
     fn into_response_upstream_error() {
-        let r =
-            AdminServiceError::UpstreamError("connection reset".into()).into_response();
+        let r = AdminServiceError::UpstreamError("connection reset".into()).into_response();
         assert_eq!(r.error.error_type, "upstream_error");
         assert!(r.error.message.contains("connection reset"));
     }
 
     #[test]
     fn into_response_refresh_error() {
-        let r =
-            AdminServiceError::RefreshError(RefreshError::TokenInvalid).into_response();
+        let r = AdminServiceError::RefreshError(RefreshError::TokenInvalid).into_response();
         assert_eq!(r.error.error_type, "refresh_error");
         assert!(r.error.message.contains("invalid_grant"));
     }
 
     #[test]
     fn into_response_upstream_http() {
-        let r = AdminServiceError::UpstreamHttp { status: 502, body: "bad gateway".into() }
-            .into_response();
+        let r = AdminServiceError::UpstreamHttp {
+            status: 502,
+            body: "bad gateway".into(),
+        }
+        .into_response();
         assert_eq!(r.error.error_type, "upstream_http_error");
         assert!(r.error.message.contains("502"));
     }
 
     #[test]
     fn into_response_config_error() {
-        let r = AdminServiceError::ConfigError(ConfigError::Validation("bad".into()))
-            .into_response();
+        let r =
+            AdminServiceError::ConfigError(ConfigError::Validation("bad".into())).into_response();
         assert_eq!(r.error.error_type, "config_error");
         assert!(r.error.message.contains("bad"));
     }
@@ -438,7 +441,11 @@ mod tests {
             AdminServiceError::NotFound { id: 1 }.into_response(),
             AdminServiceError::UpstreamError("x".into()).into_response(),
             AdminServiceError::RefreshError(RefreshError::TokenInvalid).into_response(),
-            AdminServiceError::UpstreamHttp { status: 500, body: "x".into() }.into_response(),
+            AdminServiceError::UpstreamHttp {
+                status: 500,
+                body: "x".into(),
+            }
+            .into_response(),
             AdminServiceError::ConfigError(ConfigError::Validation("x".into())).into_response(),
             AdminServiceError::DisabledByInvalidConfig(1).into_response(),
             AdminServiceError::DuplicateRefreshToken.into_response(),

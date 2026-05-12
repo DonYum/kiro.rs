@@ -503,15 +503,8 @@ mod tests {
 
     /// 构造 store，凭据文件在可删除的子目录中；返回 (store, 子目录路径)。
     /// 删除子目录后 CredentialsFileStore::save 会因父目录不存在而失败。
-    fn make_store_with_deletable_dir(
-        content: &str,
-        tag: &str,
-    ) -> (CredentialStore, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "kiro-rs-store-rm-{}-{}",
-            tag,
-            Uuid::new_v4()
-        ));
+    fn make_store_with_deletable_dir(content: &str, tag: &str) -> (CredentialStore, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("kiro-rs-store-rm-{}-{}", tag, Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("creds.json");
         fs::write(&path, content).unwrap();
@@ -524,8 +517,7 @@ mod tests {
 
     #[test]
     fn set_priority_persist_failure_does_not_modify_memory() {
-        let (store, dir) =
-            make_store_with_deletable_dir(FIXTURE_ARRAY_MIXED, "priority-rollback");
+        let (store, dir) = make_store_with_deletable_dir(FIXTURE_ARRAY_MIXED, "priority-rollback");
         let id = store.ids()[0];
         let old_priority = store.get(id).unwrap().priority;
 
@@ -543,8 +535,7 @@ mod tests {
 
     #[test]
     fn set_disabled_persist_failure_does_not_modify_memory() {
-        let (store, dir) =
-            make_store_with_deletable_dir(FIXTURE_ARRAY_MIXED, "disabled-rollback");
+        let (store, dir) = make_store_with_deletable_dir(FIXTURE_ARRAY_MIXED, "disabled-rollback");
         let id = store.ids()[0];
         assert!(!store.get(id).unwrap().disabled);
 

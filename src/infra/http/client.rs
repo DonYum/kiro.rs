@@ -45,10 +45,7 @@ impl fmt::Debug for ProxyConfig {
         f.debug_struct("ProxyConfig")
             .field("url", &mask_proxy_url(&self.url))
             .field("username", &self.username)
-            .field(
-                "password",
-                &self.password.as_ref().map(|_| "[REDACTED]"),
-            )
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
 }
@@ -147,8 +144,7 @@ mod tests {
 
     #[test]
     fn debug_redacts_password_and_masks_userinfo_in_url() {
-        let config =
-            ProxyConfig::new("http://user:secret@host:8080").with_auth("u", "very-secret");
+        let config = ProxyConfig::new("http://user:secret@host:8080").with_auth("u", "very-secret");
         let s = format!("{config:?}");
         assert!(!s.contains("secret"), "raw secret leaked: {s}");
         assert!(!s.contains("very-secret"), "raw with_auth pwd leaked: {s}");

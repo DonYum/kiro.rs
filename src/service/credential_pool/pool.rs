@@ -63,6 +63,8 @@ pub struct CredentialPool {
     refresher_idc: Arc<dyn DynTokenSource>,
     refresher_api_key: Arc<dyn DynTokenSource>,
     load_balancing_mode: Mutex<String>,
+    /// 串行化 admin 模式切换，避免并发 Config::load/save 乱序覆盖运行时模式。
+    load_balancing_mode_update_lock: Mutex<()>,
     current_id: Mutex<Option<u64>>,
     /// 按凭据 id 维护的 refresh 单点串行锁；avoid 同一凭据并发 refresh 浪费 refresh_token
     refresh_locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
@@ -128,6 +130,7 @@ impl CredentialPool {
             refresher_idc,
             refresher_api_key,
             load_balancing_mode: Mutex::new(mode),
+            load_balancing_mode_update_lock: Mutex::new(()),
             current_id: Mutex::new(None),
             refresh_locks: Mutex::new(HashMap::new()),
             add_lock: tokio::sync::Mutex::new(()),
@@ -162,9 +165,8 @@ impl CredentialPool {
 
     /// 切换负载均衡模式（仅接受 "priority" / "balanced"，其他保留旧值）
     ///
-    /// 持锁完成"读 → 写 → 持久化 → 失败回滚"全过程，避免双 lock 期间的中间态泄漏。
-    /// 持锁期间会做磁盘 I/O（Config::load + Config::save），但 admin 写路径调用频率低，
-    /// 与 get_load_balancing_mode 的读冲突可忽略。
+    /// admin 写路径用独立锁串行化；磁盘 I/O 在 load_balancing_mode 锁外完成，
+    /// 避免请求热路径 get_load_balancing_mode 被 Config::load/save 阻塞。
     pub fn set_load_balancing_mode(&self, mode: &str) -> Result<(), KiroError> {
         let normalized = match mode {
             MODE_PRIORITY | MODE_BALANCED => mode.to_string(),
@@ -175,16 +177,19 @@ impl CredentialPool {
             }
         };
 
-        let mut guard = self.load_balancing_mode.lock();
-        if *guard == normalized {
-            return Ok(());
-        }
-        let previous = std::mem::replace(&mut *guard, normalized.clone());
+        let _update_guard = self.load_balancing_mode_update_lock.lock();
 
-        if let Err(e) = self.persist_load_balancing_mode(&normalized) {
-            *guard = previous;
-            return Err(KiroError::Config(e));
+        {
+            let guard = self.load_balancing_mode.lock();
+            if *guard == normalized {
+                return Ok(());
+            }
         }
+
+        self.persist_load_balancing_mode(&normalized)
+            .map_err(KiroError::Config)?;
+
+        *self.load_balancing_mode.lock() = normalized;
         Ok(())
     }
 
