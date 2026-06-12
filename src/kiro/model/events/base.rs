@@ -14,6 +14,8 @@ pub enum EventType {
     ToolUse,
     /// 计费事件
     Metering,
+    /// 元数据事件
+    Metadata,
     /// 上下文使用率事件
     ContextUsage,
     /// 未知事件类型
@@ -27,6 +29,7 @@ impl EventType {
             "assistantResponseEvent" => Self::AssistantResponse,
             "toolUseEvent" => Self::ToolUse,
             "meteringEvent" => Self::Metering,
+            "metadataEvent" => Self::Metadata,
             "contextUsageEvent" => Self::ContextUsage,
             _ => Self::Unknown,
         }
@@ -38,6 +41,7 @@ impl EventType {
             Self::AssistantResponse => "assistantResponseEvent",
             Self::ToolUse => "toolUseEvent",
             Self::Metering => "meteringEvent",
+            Self::Metadata => "metadataEvent",
             Self::ContextUsage => "contextUsageEvent",
             Self::Unknown => "unknown",
         }
@@ -68,7 +72,9 @@ pub enum Event {
     /// 工具使用
     ToolUse(super::ToolUseEvent),
     /// 计费
-    Metering(()),
+    Metering(super::MetadataEvent),
+    /// 元数据
+    Metadata(super::MetadataEvent),
     /// 上下文使用率
     ContextUsage(super::ContextUsageEvent),
     /// 未知事件 (保留原始帧数据)
@@ -116,7 +122,14 @@ impl Event {
                 let payload = super::ToolUseEvent::from_frame(&frame)?;
                 Ok(Self::ToolUse(payload))
             }
-            EventType::Metering => Ok(Self::Metering(())),
+            EventType::Metering => {
+                let payload = super::MetadataEvent::from_frame(&frame)?;
+                Ok(Self::Metering(payload))
+            }
+            EventType::Metadata => {
+                let payload = super::MetadataEvent::from_frame(&frame)?;
+                Ok(Self::Metadata(payload))
+            }
             EventType::ContextUsage => {
                 let payload = super::ContextUsageEvent::from_frame(&frame)?;
                 Ok(Self::ContextUsage(payload))
@@ -168,6 +181,7 @@ mod tests {
         );
         assert_eq!(EventType::from_str("toolUseEvent"), EventType::ToolUse);
         assert_eq!(EventType::from_str("meteringEvent"), EventType::Metering);
+        assert_eq!(EventType::from_str("metadataEvent"), EventType::Metadata);
         assert_eq!(
             EventType::from_str("contextUsageEvent"),
             EventType::ContextUsage

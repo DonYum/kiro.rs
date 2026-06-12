@@ -3,7 +3,7 @@
 use std::convert::Infallible;
 
 use anyhow::Error;
-use crate::kiro::model::events::Event;
+use crate::kiro::model::events::{Event, TokenUsage};
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
@@ -472,6 +472,27 @@ fn create_sse_stream(
 
 use super::converter::get_context_window_size;
 
+fn add_anthropic_cache_usage(
+    usage: &mut serde_json::Value,
+    cache_usage: Option<&TokenUsage>,
+) {
+    let Some(cache_usage) = cache_usage else {
+        return;
+    };
+    let Some(obj) = usage.as_object_mut() else {
+        return;
+    };
+
+    obj.insert(
+        "cache_read_input_tokens".to_string(),
+        json!(cache_usage.cache_read_input_tokens),
+    );
+    obj.insert(
+        "cache_creation_input_tokens".to_string(),
+        json!(cache_usage.cache_write_input_tokens),
+    );
+}
+
 /// 处理非流式请求
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -515,6 +536,7 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    let mut cache_usage: Option<TokenUsage> = None;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -583,6 +605,16 @@ async fn handle_non_stream_request(
                                 actual_input_tokens
                             );
                         }
+                        Event::Metadata(metadata) | Event::Metering(metadata) => {
+                            if let Some(token_usage) = metadata.token_usage {
+                                cache_usage = Some(token_usage.clone());
+                                tracing::debug!(
+                                    cache_read_input_tokens = token_usage.cache_read_input_tokens,
+                                    cache_write_input_tokens = token_usage.cache_write_input_tokens,
+                                    "收到 Kiro tokenUsage cache 字段"
+                                );
+                            }
+                        }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
@@ -639,6 +671,12 @@ async fn handle_non_stream_request(
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
 
+    let mut usage = json!({
+        "input_tokens": final_input_tokens,
+        "output_tokens": output_tokens
+    });
+    add_anthropic_cache_usage(&mut usage, cache_usage.as_ref());
+
     // 构建 Anthropic 响应
     let response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
@@ -648,10 +686,7 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
-        }
+        "usage": usage
     });
 
     (StatusCode::OK, Json(response_body)).into_response()

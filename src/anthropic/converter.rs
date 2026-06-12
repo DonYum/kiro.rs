@@ -9,8 +9,7 @@ use uuid::Uuid;
 
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
-    HistoryCachePointMessage, HistoryUserMessage, KiroImage, Message, UserInputMessage,
-    UserInputMessageContext, UserMessage,
+    HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
 };
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
@@ -201,29 +200,6 @@ fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
     tool_names
 }
 
-fn has_last_content_block_cache_control(content: &serde_json::Value) -> bool {
-    content
-        .as_array()
-        .and_then(|blocks| blocks.last())
-        .and_then(|last_block| last_block.as_object())
-        .and_then(|block| block.get("cache_control"))
-        .is_some()
-}
-
-fn maybe_insert_history_cache_point(
-    history: &mut Vec<Message>,
-    source_messages: &[&super::types::Message],
-) {
-    if source_messages
-        .iter()
-        .any(|msg| has_last_content_block_cache_control(&msg.content))
-    {
-        history.push(Message::CachePoint(
-            HistoryCachePointMessage::default_marker(),
-        ));
-    }
-}
-
 /// 为历史中使用但不在 tools 列表中的工具创建占位符定义
 /// Kiro API 要求：历史消息中引用的工具必须在 currentMessage.tools 中有定义
 fn create_placeholder_tool(name: &str) -> Tool {
@@ -313,9 +289,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         }
     }
 
-    let cache_point_count =
-        tools.iter().filter(|tool| tool.is_cache_point()).count()
-            + history.iter().filter(|message| message.is_cache_point()).count();
+    let cache_point_count = tools.iter().filter(|tool| tool.is_cache_point()).count();
     if cache_point_count > 0 {
         tracing::info!(
             cache_point_count,
@@ -436,13 +410,7 @@ pub fn request_fingerprint(req: &MessagesRequest) {
         .iter()
         .map(|message| count_cache_control_markers(&message.content))
         .sum::<usize>();
-    let cache_point_count = tool_cache_control_count
-        + req
-            .messages
-            .iter()
-            .take(req.messages.len().saturating_sub(1))
-            .filter(|message| has_last_content_block_cache_control(&message.content))
-            .count();
+    let cache_point_count = tool_cache_control_count;
 
     tracing::info!(
         model = %req.model,
@@ -615,7 +583,6 @@ fn validate_tool_pairing(
                     history_tool_result_ids.insert(result.tool_use_id.clone());
                 }
             }
-            Message::CachePoint(_) => {}
         }
     }
 
@@ -867,7 +834,6 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
             if !assistant_buffer.is_empty() {
                 let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
                 history.push(Message::Assistant(merged));
-                maybe_insert_history_cache_point(&mut history, &assistant_buffer);
                 assistant_buffer.clear();
             }
             user_buffer.push(msg);
@@ -876,7 +842,6 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
             if !user_buffer.is_empty() {
                 let merged_user = merge_user_messages(&user_buffer, model_id)?;
                 history.push(Message::User(merged_user));
-                maybe_insert_history_cache_point(&mut history, &user_buffer);
                 user_buffer.clear();
             }
             // 累积 assistant 消息（支持连续多条）
@@ -888,14 +853,12 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     if !assistant_buffer.is_empty() {
         let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
         history.push(Message::Assistant(merged));
-        maybe_insert_history_cache_point(&mut history, &assistant_buffer);
     }
 
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
         let merged_user = merge_user_messages(&user_buffer, model_id)?;
         history.push(Message::User(merged_user));
-        maybe_insert_history_cache_point(&mut history, &user_buffer);
 
         // 自动配对一个 "OK" 的 assistant 响应
         let auto_assistant = HistoryAssistantMessage::new("OK");
@@ -1320,55 +1283,6 @@ mod tests {
     }
 
     #[test]
-    fn test_history_message_cache_control_inserts_kiro_cache_point() {
-        use super::super::types::Message as AnthropicMessage;
-
-        let req = MessagesRequest {
-            model: "claude-sonnet-4-6".to_string(),
-            max_tokens: 1024,
-            messages: vec![
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: serde_json::json!([
-                        {
-                            "type": "text",
-                            "text": "stable prefix",
-                            "cache_control": {"type": "ephemeral"}
-                        }
-                    ]),
-                },
-                AnthropicMessage {
-                    role: "assistant".to_string(),
-                    content: serde_json::json!([
-                        {"type": "text", "text": "ack"}
-                    ]),
-                },
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: serde_json::json!("current request"),
-                },
-            ],
-            system: None,
-            stream: false,
-            tools: None,
-            tool_choice: None,
-            thinking: None,
-            output_config: None,
-            metadata: None,
-        };
-
-        let result = convert_request(&req).unwrap();
-        let history = &result.conversation_state.history;
-
-        assert!(matches!(history[0], Message::User(_)));
-        assert!(history[1].is_cache_point());
-        assert!(matches!(history[2], Message::Assistant(_)));
-
-        let history_json = serde_json::to_value(history).unwrap();
-        assert_eq!(history_json[1]["cachePoint"]["type"], "default");
-    }
-
-    #[test]
     fn test_system_cache_control_does_not_insert_kiro_cache_point() {
         use super::super::types::{
             Message as AnthropicMessage, SystemMessage as AnthropicSystemMessage,
@@ -1403,13 +1317,8 @@ mod tests {
             .tools;
 
         assert_eq!(tools.iter().filter(|tool| tool.is_cache_point()).count(), 0);
-        assert_eq!(
-            history
-                .iter()
-                .filter(|message| message.is_cache_point())
-                .count(),
-            0
-        );
+        let history_json = serde_json::to_value(history).unwrap();
+        assert!(!history_json.to_string().contains("cachePoint"));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::kiro::model::events::Event;
+use crate::kiro::model::events::{Event, TokenUsage};
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -293,6 +293,32 @@ pub struct SseStateManager {
     has_tool_use: bool,
 }
 
+fn anthropic_usage_json(
+    input_tokens: i32,
+    output_tokens: i32,
+    cache_usage: Option<&TokenUsage>,
+) -> serde_json::Value {
+    let mut usage = json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens
+    });
+
+    if let Some(cache_usage) = cache_usage {
+        if let Some(obj) = usage.as_object_mut() {
+            obj.insert(
+                "cache_read_input_tokens".to_string(),
+                json!(cache_usage.cache_read_input_tokens),
+            );
+            obj.insert(
+                "cache_creation_input_tokens".to_string(),
+                json!(cache_usage.cache_write_input_tokens),
+            );
+        }
+    }
+
+    usage
+}
+
 impl Default for SseStateManager {
     fn default() -> Self {
         Self::new()
@@ -458,6 +484,7 @@ impl SseStateManager {
         &mut self,
         input_tokens: i32,
         output_tokens: i32,
+        cache_usage: Option<&TokenUsage>,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -486,10 +513,7 @@ impl SseStateManager {
                         "stop_reason": self.get_stop_reason(),
                         "stop_sequence": null
                     },
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens
-                    }
+                    "usage": anthropic_usage_json(input_tokens, output_tokens, cache_usage)
                 }),
             ));
         }
@@ -523,6 +547,8 @@ pub struct StreamContext {
     pub context_input_tokens: Option<i32>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
+    /// Kiro reported prompt-cache usage, if present in metadata events.
+    pub cache_usage: Option<TokenUsage>,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -559,6 +585,7 @@ impl StreamContext {
             input_tokens,
             context_input_tokens: None,
             output_tokens: 0,
+            cache_usage: None,
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
@@ -652,6 +679,17 @@ impl StreamContext {
                     context_usage.context_usage_percentage,
                     actual_input_tokens
                 );
+                Vec::new()
+            }
+            Event::Metadata(metadata) | Event::Metering(metadata) => {
+                if let Some(token_usage) = metadata.token_usage.as_ref() {
+                    self.cache_usage = Some(token_usage.clone());
+                    tracing::debug!(
+                        cache_read_input_tokens = token_usage.cache_read_input_tokens,
+                        cache_write_input_tokens = token_usage.cache_write_input_tokens,
+                        "收到 Kiro tokenUsage cache 字段"
+                    );
+                }
                 Vec::new()
             }
             Event::Error {
@@ -1123,7 +1161,11 @@ impl StreamContext {
         // 生成最终事件
         events.extend(
             self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
+                .generate_final_events(
+                    final_input_tokens,
+                    self.output_tokens,
+                    self.cache_usage.as_ref(),
+                ),
         );
         events
     }
@@ -1214,6 +1256,12 @@ impl BufferedStreamContext {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
                         usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                        if let Some(cache_usage) = self.inner.cache_usage.as_ref() {
+                            usage["cache_read_input_tokens"] =
+                                serde_json::json!(cache_usage.cache_read_input_tokens);
+                            usage["cache_creation_input_tokens"] =
+                                serde_json::json!(cache_usage.cache_write_input_tokens);
+                        }
                     }
                 }
             }
@@ -1290,6 +1338,38 @@ mod tests {
         // 重复 stop 应该被跳过
         let event = manager.handle_content_block_stop(0);
         assert!(event.is_none());
+    }
+
+    #[test]
+    fn test_metadata_cache_usage_in_message_delta() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
+        let mut events = ctx.generate_initial_events();
+
+        events.extend(ctx.process_kiro_event(&Event::Metadata(
+            crate::kiro::model::events::MetadataEvent {
+                token_usage: Some(crate::kiro::model::events::TokenUsage {
+                    cache_read_input_tokens: 40,
+                    cache_write_input_tokens: 10,
+                    ..Default::default()
+                }),
+            },
+        )));
+        events.extend(ctx.generate_final_events());
+
+        let message_delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta event");
+
+        assert_eq!(
+            message_delta.data["usage"]["cache_read_input_tokens"],
+            40
+        );
+        assert_eq!(
+            message_delta.data["usage"]["cache_creation_input_tokens"],
+            10
+        );
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 12);
     }
 
     #[test]
