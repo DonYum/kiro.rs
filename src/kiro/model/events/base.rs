@@ -72,7 +72,7 @@ pub enum Event {
     /// 工具使用
     ToolUse(super::ToolUseEvent),
     /// 计费
-    Metering(super::MetadataEvent),
+    Metering(super::MeteringEvent),
     /// 元数据
     Metadata(super::MetadataEvent),
     /// 上下文使用率
@@ -128,7 +128,7 @@ impl Event {
                 Ok(Self::ToolUse(payload))
             }
             EventType::Metering => {
-                let payload = super::MetadataEvent::from_frame(&frame)?;
+                let payload = super::MeteringEvent::from_frame(&frame)?;
                 Ok(Self::Metering(payload))
             }
             EventType::Metadata => {

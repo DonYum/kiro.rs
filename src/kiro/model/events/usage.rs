@@ -45,6 +45,28 @@ impl EventPayload for MetadataEvent {
     }
 }
 
+/// Flat metering event containing Kiro credit usage.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeteringEvent {
+    /// Credits consumed by this request. Kiro uses this as the practical
+    /// cache-hit signal on backends that do not emit metadataEvent tokenUsage.
+    #[serde(default)]
+    pub usage: Option<f64>,
+    /// Input tokens reported by the metering event, when present.
+    #[serde(default)]
+    pub input_tokens: Option<i32>,
+    /// Output tokens reported by the metering event, when present.
+    #[serde(default)]
+    pub output_tokens: Option<i32>,
+}
+
+impl EventPayload for MeteringEvent {
+    fn from_frame(frame: &Frame) -> ParseResult<Self> {
+        frame.payload_as_json()
+    }
+}
+
 impl MetadataEvent {
     /// Anthropic's input token number excludes cache writes but includes cache reads.
     #[allow(dead_code)]
@@ -86,5 +108,21 @@ mod tests {
     fn test_metadata_event_without_token_usage_deserialize() {
         let event: MetadataEvent = serde_json::from_str(r#"{"usage": 1.5}"#).unwrap();
         assert!(event.token_usage.is_none());
+    }
+
+    #[test]
+    fn test_metering_event_deserialize() {
+        let event: MeteringEvent = serde_json::from_str(
+            r#"{
+                "usage": 1.5,
+                "inputTokens": 100,
+                "outputTokens": 20
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(event.usage, Some(1.5));
+        assert_eq!(event.input_tokens, Some(100));
+        assert_eq!(event.output_tokens, Some(20));
     }
 }

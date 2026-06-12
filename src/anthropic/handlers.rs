@@ -605,7 +605,7 @@ async fn handle_non_stream_request(
                                 actual_input_tokens
                             );
                         }
-                        Event::Metadata(metadata) | Event::Metering(metadata) => {
+                        Event::Metadata(metadata) => {
                             if let Some(token_usage) = metadata.token_usage {
                                 cache_usage = Some(token_usage.clone());
                                 tracing::debug!(
@@ -614,6 +614,14 @@ async fn handle_non_stream_request(
                                     "收到 Kiro tokenUsage cache 字段"
                                 );
                             }
+                        }
+                        Event::Metering(metering) => {
+                            tracing::debug!(
+                                usage = metering.usage,
+                                input_tokens = metering.input_tokens,
+                                output_tokens = metering.output_tokens,
+                                "收到 Kiro meteringEvent credits 字段"
+                            );
                         }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
