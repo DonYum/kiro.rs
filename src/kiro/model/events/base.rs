@@ -113,6 +113,11 @@ impl Event {
         let event_type_str = frame.event_type().unwrap_or("unknown");
         let event_type = EventType::from_str(event_type_str);
 
+        tracing::debug!(
+            event_type = event_type_str,
+            "收到 Kiro event frame"
+        );
+
         match event_type {
             EventType::AssistantResponse => {
                 let payload = super::AssistantResponseEvent::from_frame(&frame)?;
@@ -134,7 +139,13 @@ impl Event {
                 let payload = super::ContextUsageEvent::from_frame(&frame)?;
                 Ok(Self::ContextUsage(payload))
             }
-            EventType::Unknown => Ok(Self::Unknown {}),
+            EventType::Unknown => {
+                tracing::info!(
+                    event_type = event_type_str,
+                    "收到未知 Kiro event frame"
+                );
+                Ok(Self::Unknown {})
+            }
         }
     }
 
