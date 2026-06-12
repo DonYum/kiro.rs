@@ -616,7 +616,7 @@ async fn handle_non_stream_request(
                             }
                         }
                         Event::Metering(metering) => {
-                            tracing::debug!(
+                            tracing::info!(
                                 usage = metering.usage,
                                 input_tokens = metering.input_tokens,
                                 output_tokens = metering.output_tokens,

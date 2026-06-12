@@ -693,7 +693,7 @@ impl StreamContext {
                 Vec::new()
             }
             Event::Metering(metering) => {
-                tracing::debug!(
+                tracing::info!(
                     usage = metering.usage,
                     input_tokens = metering.input_tokens,
                     output_tokens = metering.output_tokens,
