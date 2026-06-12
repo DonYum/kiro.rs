@@ -9,7 +9,8 @@ use uuid::Uuid;
 
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
-    HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
+    HistoryCachePointMessage, HistoryUserMessage, KiroImage, Message, UserInputMessage,
+    UserInputMessageContext, UserMessage,
 };
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
@@ -200,22 +201,43 @@ fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
     tool_names
 }
 
+fn has_last_content_block_cache_control(content: &serde_json::Value) -> bool {
+    content
+        .as_array()
+        .and_then(|blocks| blocks.last())
+        .and_then(|last_block| last_block.as_object())
+        .and_then(|block| block.get("cache_control"))
+        .is_some()
+}
+
+fn maybe_insert_history_cache_point(
+    history: &mut Vec<Message>,
+    source_messages: &[&super::types::Message],
+) {
+    if source_messages
+        .iter()
+        .any(|msg| has_last_content_block_cache_control(&msg.content))
+    {
+        history.push(Message::CachePoint(
+            HistoryCachePointMessage::default_marker(),
+        ));
+    }
+}
+
 /// 为历史中使用但不在 tools 列表中的工具创建占位符定义
 /// Kiro API 要求：历史消息中引用的工具必须在 currentMessage.tools 中有定义
 fn create_placeholder_tool(name: &str) -> Tool {
-    Tool {
-        tool_specification: ToolSpecification {
-            name: name.to_string(),
-            description: "Tool used in conversation history".to_string(),
-            input_schema: InputSchema::from_json(serde_json::json!({
-                "$schema": "http://json-schema.org/draft-07/schema#",
-                "type": "object",
-                "properties": {},
-                "required": [],
-                "additionalProperties": true
-            })),
-        },
-    }
+    Tool::specification(ToolSpecification {
+        name: name.to_string(),
+        description: "Tool used in conversation history".to_string(),
+        input_schema: InputSchema::from_json(serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": true
+        })),
+    })
 }
 
 /// 将 Anthropic 请求转换为 Kiro 请求
@@ -282,13 +304,23 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let history_tool_names = collect_history_tool_names(&history);
     let existing_tool_names: std::collections::HashSet<_> = tools
         .iter()
-        .map(|t| t.tool_specification.name.to_lowercase())
+        .filter_map(|t| t.tool_name().map(str::to_lowercase))
         .collect();
 
     for tool_name in history_tool_names {
         if !existing_tool_names.contains(&tool_name.to_lowercase()) {
             tools.push(create_placeholder_tool(&tool_name));
         }
+    }
+
+    let cache_point_count =
+        tools.iter().filter(|tool| tool.is_cache_point()).count()
+            + history.iter().filter(|message| message.is_cache_point()).count();
+    if cache_point_count > 0 {
+        tracing::info!(
+            cache_point_count,
+            "Kiro cachePoint markers inserted from Anthropic cache_control"
+        );
     }
 
     // 11. 构建 UserInputMessageContext
@@ -404,6 +436,13 @@ pub fn request_fingerprint(req: &MessagesRequest) {
         .iter()
         .map(|message| count_cache_control_markers(&message.content))
         .sum::<usize>();
+    let cache_point_count = tool_cache_control_count
+        + req
+            .messages
+            .iter()
+            .take(req.messages.len().saturating_sub(1))
+            .filter(|message| has_last_content_block_cache_control(&message.content))
+            .count();
 
     tracing::info!(
         model = %req.model,
@@ -421,6 +460,7 @@ pub fn request_fingerprint(req: &MessagesRequest) {
         system_cache_control_count,
         tool_cache_control_count,
         message_cache_control_count,
+        cache_point_count,
         "Anthropic request fingerprint"
     );
 
@@ -575,6 +615,7 @@ fn validate_tool_pairing(
                     history_tool_result_ids.insert(result.tool_use_id.clone());
                 }
             }
+            Message::CachePoint(_) => {}
         }
     }
 
@@ -683,44 +724,49 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
 }
 
 /// 转换工具定义
-fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut HashMap<String, String>) -> Vec<Tool> {
+fn convert_tools(
+    tools: &Option<Vec<super::types::Tool>>,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Vec<Tool> {
     let Some(tools) = tools else {
         return Vec::new();
     };
 
-    tools
-        .iter()
-        .map(|t| {
-            let mut description = t.description.clone();
+    let mut converted = Vec::new();
+    for t in tools {
+        let mut description = t.description.clone();
 
-            // 对 Write/Edit 工具追加自定义描述后缀
-            let suffix = match t.name.as_str() {
-                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
-                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
-                _ => "",
-            };
-            if !suffix.is_empty() {
-                description.push('\n');
-                description.push_str(suffix);
-            }
+        // 对 Write/Edit 工具追加自定义描述后缀
+        let suffix = match t.name.as_str() {
+            "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
+            "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
+            _ => "",
+        };
+        if !suffix.is_empty() {
+            description.push('\n');
+            description.push_str(suffix);
+        }
 
-            // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
-            let description = match description.char_indices().nth(10000) {
-                Some((idx, _)) => description[..idx].to_string(),
-                None => description,
-            };
+        // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
+        let description = match description.char_indices().nth(10000) {
+            Some((idx, _)) => description[..idx].to_string(),
+            None => description,
+        };
 
-            Tool {
-                tool_specification: ToolSpecification {
-                    name: map_tool_name(&t.name, tool_name_map),
-                    description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(
-                        serde_json::to_value(&t.input_schema).unwrap_or_default(),
-                    )),
-                },
-            }
-        })
-        .collect()
+        converted.push(Tool::specification(ToolSpecification {
+            name: map_tool_name(&t.name, tool_name_map),
+            description,
+            input_schema: InputSchema::from_json(normalize_json_schema(
+                serde_json::to_value(&t.input_schema).unwrap_or_default(),
+            )),
+        }));
+
+        if t.cache_control.is_some() {
+            converted.push(Tool::cache_point_default());
+        }
+    }
+
+    converted
 }
 
 /// 生成thinking标签前缀
@@ -821,6 +867,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
             if !assistant_buffer.is_empty() {
                 let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
                 history.push(Message::Assistant(merged));
+                maybe_insert_history_cache_point(&mut history, &assistant_buffer);
                 assistant_buffer.clear();
             }
             user_buffer.push(msg);
@@ -829,6 +876,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
             if !user_buffer.is_empty() {
                 let merged_user = merge_user_messages(&user_buffer, model_id)?;
                 history.push(Message::User(merged_user));
+                maybe_insert_history_cache_point(&mut history, &user_buffer);
                 user_buffer.clear();
             }
             // 累积 assistant 消息（支持连续多条）
@@ -840,12 +888,14 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     if !assistant_buffer.is_empty() {
         let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
         history.push(Message::Assistant(merged));
+        maybe_insert_history_cache_point(&mut history, &assistant_buffer);
     }
 
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
         let merged_user = merge_user_messages(&user_buffer, model_id)?;
         history.push(Message::User(merged_user));
+        maybe_insert_history_cache_point(&mut history, &user_buffer);
 
         // 自动配对一个 "OK" 的 assistant 响应
         let auto_assistant = HistoryAssistantMessage::new("OK");
@@ -1134,6 +1184,9 @@ mod tests {
     #[test]
     fn test_create_placeholder_tool() {
         let tool = create_placeholder_tool("my_custom_tool");
+        let Tool::Specification(tool) = tool else {
+            panic!("placeholder tool should be a tool specification");
+        };
 
         assert_eq!(tool.tool_specification.name, "my_custom_tool");
         assert!(!tool.tool_specification.description.is_empty());
@@ -1219,6 +1272,147 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_cache_control_inserts_kiro_cache_point() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let mut schema = std::collections::BTreeMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        schema.insert("properties".to_string(), serde_json::json!({}));
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            system: None,
+            stream: false,
+            tools: Some(vec![AnthropicTool {
+                name: "Read".to_string(),
+                description: "Read files".to_string(),
+                input_schema: schema,
+                tool_type: None,
+                max_uses: None,
+                cache_control: Some(serde_json::json!({"type": "ephemeral"})),
+            }]),
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].tool_name(), Some("Read"));
+        assert!(tools[1].is_cache_point());
+
+        let tools_json = serde_json::to_value(tools).unwrap();
+        assert_eq!(tools_json[0]["toolSpecification"]["name"], "Read");
+        assert_eq!(tools_json[1]["cachePoint"]["type"], "default");
+    }
+
+    #[test]
+    fn test_history_message_cache_control_inserts_kiro_cache_point() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {
+                            "type": "text",
+                            "text": "stable prefix",
+                            "cache_control": {"type": "ephemeral"}
+                        }
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "ack"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("current request"),
+                },
+            ],
+            system: None,
+            stream: false,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let history = &result.conversation_state.history;
+
+        assert!(matches!(history[0], Message::User(_)));
+        assert!(history[1].is_cache_point());
+        assert!(matches!(history[2], Message::Assistant(_)));
+
+        let history_json = serde_json::to_value(history).unwrap();
+        assert_eq!(history_json[1]["cachePoint"]["type"], "default");
+    }
+
+    #[test]
+    fn test_system_cache_control_does_not_insert_kiro_cache_point() {
+        use super::super::types::{
+            Message as AnthropicMessage, SystemMessage as AnthropicSystemMessage,
+        };
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            system: Some(vec![AnthropicSystemMessage {
+                text: "stable system".to_string(),
+                cache_control: Some(serde_json::json!({"type": "ephemeral"})),
+            }]),
+            stream: false,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let history = &result.conversation_state.history;
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+
+        assert_eq!(tools.iter().filter(|tool| tool.is_cache_point()).count(), 0);
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| message.is_cache_point())
+                .count(),
+            0
+        );
+    }
+
+    #[test]
     fn test_tool_name_mapping_in_convert_request() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
@@ -1267,7 +1461,7 @@ mod tests {
         // Kiro 请求中的工具名应该是短名称
         let tools = &result.conversation_state.current_message.user_input_message
             .user_input_message_context.tools;
-        assert_eq!(tools[0].tool_specification.name, *short);
+        assert_eq!(tools[0].tool_name(), Some(short.as_str()));
     }
 
     #[test]
@@ -1387,7 +1581,7 @@ mod tests {
 
         assert!(!tools.is_empty(), "tools 列表不应为空");
         assert!(
-            tools.iter().any(|t| t.tool_specification.name == "read"),
+            tools.iter().any(|t| t.tool_name() == Some("read")),
             "tools 列表应包含 'read' 工具的占位符定义"
         );
     }

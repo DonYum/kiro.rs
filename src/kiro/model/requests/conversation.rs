@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::tool::{Tool, ToolResult, ToolUseEntry};
+use super::tool::{CachePoint, Tool, ToolResult, ToolUseEntry};
 
 /// 对话状态
 ///
@@ -202,7 +202,7 @@ pub struct KiroImageSource {
 
 /// 历史消息
 ///
-/// 可以是用户消息或助手消息
+/// 可以是用户消息、助手消息或缓存断点
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Message {
@@ -210,6 +210,32 @@ pub enum Message {
     User(HistoryUserMessage),
     /// 助手消息
     Assistant(HistoryAssistantMessage),
+    /// 缓存断点
+    CachePoint(HistoryCachePointMessage),
+}
+
+impl Message {
+    /// 是否为缓存断点
+    pub fn is_cache_point(&self) -> bool {
+        matches!(self, Self::CachePoint(_))
+    }
+}
+
+/// 历史消息中的 Kiro prompt cache 断点
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryCachePointMessage {
+    /// 缓存断点定义
+    pub cache_point: CachePoint,
+}
+
+impl HistoryCachePointMessage {
+    /// 创建默认缓存断点
+    pub fn default_marker() -> Self {
+        Self {
+            cache_point: CachePoint::default_marker(),
+        }
+    }
 }
 
 /// 历史用户消息
@@ -355,6 +381,15 @@ mod tests {
         let json = serde_json::to_string(&history).unwrap();
         assert!(json.contains("userInputMessage"));
         assert!(json.contains("assistantResponseMessage"));
+    }
+
+    #[test]
+    fn test_history_cache_point_serialize() {
+        let history = vec![Message::CachePoint(HistoryCachePointMessage::default_marker())];
+
+        let value = serde_json::to_value(&history).unwrap();
+        assert_eq!(value[0]["cachePoint"]["type"], "default");
+        assert!(history[0].is_cache_point());
     }
 
     #[test]
