@@ -1,7 +1,7 @@
 //! Anthropic API 类型定义
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 // === 错误响应 ===
 
@@ -151,6 +151,7 @@ where
         {
             Ok(Some(vec![SystemMessage {
                 text: value.to_string(),
+                cache_control: None,
             }]))
         }
 
@@ -199,6 +200,8 @@ pub struct Message {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemMessage {
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<serde_json::Value>,
 }
 
 /// 工具定义
@@ -219,10 +222,13 @@ pub struct Tool {
     pub description: String,
     /// 输入参数 schema（普通工具必需，WebSearch 工具无此字段）
     #[serde(default)]
-    pub input_schema: HashMap<String, serde_json::Value>,
+    pub input_schema: BTreeMap<String, serde_json::Value>,
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<i32>,
+    /// Prompt cache 控制标记。Kiro API 暂不直接使用；保留用于安全指纹日志。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<serde_json::Value>,
 }
 
 /// 内容块

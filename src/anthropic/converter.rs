@@ -335,6 +335,112 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     })
 }
 
+fn hash_value_hex(value: &serde_json::Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(value).unwrap_or_default());
+    let hash_hex = format!("{:x}", hasher.finalize());
+    hash_hex[..16].to_string()
+}
+
+fn hash_text_hex(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    let hash_hex = format!("{:x}", hasher.finalize());
+    hash_hex[..16].to_string()
+}
+
+pub fn request_fingerprint(req: &MessagesRequest) {
+    let system_text = req
+        .system
+        .as_ref()
+        .map(|system| {
+            system
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+
+    let tools = req.tools.as_deref().unwrap_or(&[]);
+    let tool_schema_hashes = tools
+        .iter()
+        .map(|tool| {
+            let schema = serde_json::to_value(&tool.input_schema).unwrap_or_default();
+            hash_value_hex(&schema)
+        })
+        .collect::<Vec<_>>();
+    let tools_signature = tools
+        .iter()
+        .zip(tool_schema_hashes.iter())
+        .map(|(tool, schema_hash)| {
+            format!(
+                "{}:{}:{}",
+                tool.name,
+                hash_text_hex(&tool.description),
+                schema_hash
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+
+    let metadata_user_id_hash = req
+        .metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_deref())
+        .map(hash_text_hex);
+
+    let system_cache_control_count = req
+        .system
+        .as_ref()
+        .map(|system| system.iter().filter(|s| s.cache_control.is_some()).count())
+        .unwrap_or(0);
+    let tool_cache_control_count = tools
+        .iter()
+        .filter(|tool| tool.cache_control.is_some())
+        .count();
+    let message_cache_control_count = req
+        .messages
+        .iter()
+        .map(|message| count_cache_control_markers(&message.content))
+        .sum::<usize>();
+
+    tracing::info!(
+        model = %req.model,
+        stream = req.stream,
+        message_count = req.messages.len(),
+        system_blocks = req.system.as_ref().map_or(0, Vec::len),
+        system_hash = %hash_text_hex(&system_text),
+        tools_count = tools.len(),
+        tools_hash = %hash_text_hex(&tools_signature),
+        thinking_type = ?req.thinking.as_ref().map(|t| t.thinking_type.as_str()),
+        thinking_budget_tokens = ?req.thinking.as_ref().map(|t| t.budget_tokens),
+        effort = ?req.output_config.as_ref().map(|c| c.effort.as_str()),
+        metadata_user_id_present = req.metadata.as_ref().and_then(|m| m.user_id.as_ref()).is_some(),
+        metadata_user_id_hash = ?metadata_user_id_hash,
+        system_cache_control_count,
+        tool_cache_control_count,
+        message_cache_control_count,
+        "Anthropic request fingerprint"
+    );
+
+    tracing::debug!(
+        tool_schema_hashes = ?tool_schema_hashes,
+        "Anthropic request per-tool schema fingerprints"
+    );
+}
+
+fn count_cache_control_markers(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(map) => {
+            let own = usize::from(map.contains_key("cache_control"));
+            own + map.values().map(count_cache_control_markers).sum::<usize>()
+        }
+        serde_json::Value::Array(items) => items.iter().map(count_cache_control_markers).sum(),
+        _ => 0,
+    }
+}
+
 /// 确定聊天触发类型
 /// "AUTO" 模式可能会导致 400 Bad Request 错误
 fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
@@ -608,7 +714,9 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
                 tool_specification: ToolSpecification {
                     name: map_tool_name(&t.name, tool_name_map),
                     description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(t.input_schema))),
+                    input_schema: InputSchema::from_json(normalize_json_schema(
+                        serde_json::to_value(&t.input_schema).unwrap_or_default(),
+                    )),
                 },
             }
         })
@@ -901,12 +1009,12 @@ mod tests {
     #[test]
     fn test_map_model_sonnet() {
         assert!(
-            map_model("claude-sonnet-4-20250514")
+            map_model("claude-sonnet-4-6")
                 .unwrap()
                 .contains("sonnet")
         );
         assert!(
-            map_model("claude-3-5-sonnet-20241022")
+            map_model("claude-sonnet-4-5-20250929")
                 .unwrap()
                 .contains("sonnet")
         );
@@ -915,7 +1023,7 @@ mod tests {
     #[test]
     fn test_map_model_opus() {
         assert!(
-            map_model("claude-opus-4-20250514")
+            map_model("claude-opus-4-6")
                 .unwrap()
                 .contains("opus")
         );
@@ -924,7 +1032,7 @@ mod tests {
     #[test]
     fn test_map_model_haiku() {
         assert!(
-            map_model("claude-haiku-4-20250514")
+            map_model("claude-haiku-4-5-20251001")
                 .unwrap()
                 .contains("haiku")
         );
@@ -980,7 +1088,7 @@ mod tests {
     fn test_determine_chat_trigger_type() {
         // 无工具时返回 MANUAL
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![],
             stream: false,
@@ -1073,18 +1181,56 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_input_schema_serializes_stably() {
+        use super::super::types::Tool as AnthropicTool;
+        use std::collections::BTreeMap;
+
+        let mut schema_a = BTreeMap::new();
+        schema_a.insert("type".to_string(), serde_json::json!("object"));
+        schema_a.insert("properties".to_string(), serde_json::json!({}));
+        schema_a.insert("required".to_string(), serde_json::json!([]));
+
+        let mut schema_b = BTreeMap::new();
+        schema_b.insert("required".to_string(), serde_json::json!([]));
+        schema_b.insert("properties".to_string(), serde_json::json!({}));
+        schema_b.insert("type".to_string(), serde_json::json!("object"));
+
+        let tool_a = AnthropicTool {
+            name: "Read".to_string(),
+            description: "Read files".to_string(),
+            input_schema: schema_a,
+            tool_type: None,
+            max_uses: None,
+            cache_control: None,
+        };
+        let tool_b = AnthropicTool {
+            name: "Read".to_string(),
+            description: "Read files".to_string(),
+            input_schema: schema_b,
+            tool_type: None,
+            max_uses: None,
+            cache_control: None,
+        };
+
+        assert_eq!(
+            serde_json::to_string(&tool_a.input_schema).unwrap(),
+            serde_json::to_string(&tool_b.input_schema).unwrap()
+        );
+    }
+
+    #[test]
     fn test_tool_name_mapping_in_convert_request() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
         let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
         assert!(long_tool_name.len() > TOOL_NAME_MAX_LEN);
 
-        let mut schema = std::collections::HashMap::new();
+        let mut schema = std::collections::BTreeMap::new();
         schema.insert("type".to_string(), serde_json::json!("object"));
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1100,6 +1246,7 @@ mod tests {
                 input_schema: schema,
                 tool_type: None,
                 max_uses: None,
+                cache_control: None,
             }]),
             thinking: None,
             tool_choice: None,
@@ -1129,12 +1276,12 @@ mod tests {
 
         let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
 
-        let mut schema = std::collections::HashMap::new();
+        let mut schema = std::collections::BTreeMap::new();
         schema.insert("type".to_string(), serde_json::json!("object"));
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1163,6 +1310,7 @@ mod tests {
                 input_schema: schema,
                 tool_type: None,
                 max_uses: None,
+                cache_control: None,
             }]),
             thinking: None,
             tool_choice: None,
@@ -1197,7 +1345,7 @@ mod tests {
 
         // 创建一个请求，历史中有工具使用，但 tools 列表为空
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1296,7 +1444,7 @@ mod tests {
 
         // 测试带有 metadata 的请求，应该使用 session UUID 作为 conversationId
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -1328,7 +1476,7 @@ mod tests {
 
         // 测试没有 metadata 的请求，应该生成新的 UUID
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -1735,7 +1883,7 @@ mod tests {
         use super::super::types::Message as AnthropicMessage;
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
