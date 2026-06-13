@@ -9,6 +9,45 @@ use uuid::Uuid;
 
 use crate::kiro::model::events::{Event, TokenUsage};
 
+/// Kiro credit metering reported by meteringEvent.
+#[derive(Debug, Clone, Default)]
+pub struct KiroMeteringUsage {
+    pub credits: Option<f64>,
+    pub input_tokens: Option<i32>,
+    pub output_tokens: Option<i32>,
+}
+
+impl KiroMeteringUsage {
+    pub fn is_empty(&self) -> bool {
+        self.credits.is_none() && self.input_tokens.is_none() && self.output_tokens.is_none()
+    }
+}
+
+pub fn add_kiro_metering_usage(
+    usage: &mut serde_json::Value,
+    metering_usage: Option<&KiroMeteringUsage>,
+) {
+    let Some(metering_usage) = metering_usage else {
+        return;
+    };
+    if metering_usage.is_empty() {
+        return;
+    }
+    let Some(obj) = usage.as_object_mut() else {
+        return;
+    };
+
+    if let Some(credits) = metering_usage.credits {
+        obj.insert("upstream_kiro_credits".to_string(), json!(credits));
+    }
+    if let Some(input_tokens) = metering_usage.input_tokens {
+        obj.insert("upstream_kiro_input_tokens".to_string(), json!(input_tokens));
+    }
+    if let Some(output_tokens) = metering_usage.output_tokens {
+        obj.insert("upstream_kiro_output_tokens".to_string(), json!(output_tokens));
+    }
+}
+
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
 /// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
@@ -297,6 +336,7 @@ fn anthropic_usage_json(
     input_tokens: i32,
     output_tokens: i32,
     cache_usage: Option<&TokenUsage>,
+    metering_usage: Option<&KiroMeteringUsage>,
 ) -> serde_json::Value {
     let mut usage = json!({
         "input_tokens": input_tokens,
@@ -315,6 +355,8 @@ fn anthropic_usage_json(
             );
         }
     }
+
+    add_kiro_metering_usage(&mut usage, metering_usage);
 
     usage
 }
@@ -485,6 +527,7 @@ impl SseStateManager {
         input_tokens: i32,
         output_tokens: i32,
         cache_usage: Option<&TokenUsage>,
+        metering_usage: Option<&KiroMeteringUsage>,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -513,7 +556,7 @@ impl SseStateManager {
                         "stop_reason": self.get_stop_reason(),
                         "stop_sequence": null
                     },
-                    "usage": anthropic_usage_json(input_tokens, output_tokens, cache_usage)
+                    "usage": anthropic_usage_json(input_tokens, output_tokens, cache_usage, metering_usage)
                 }),
             ));
         }
@@ -549,6 +592,8 @@ pub struct StreamContext {
     pub output_tokens: i32,
     /// Kiro reported prompt-cache usage, if present in metadata events.
     pub cache_usage: Option<TokenUsage>,
+    /// Kiro credit metering, if present in metering events.
+    pub metering_usage: Option<KiroMeteringUsage>,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -586,6 +631,7 @@ impl StreamContext {
             context_input_tokens: None,
             output_tokens: 0,
             cache_usage: None,
+            metering_usage: None,
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
@@ -693,6 +739,11 @@ impl StreamContext {
                 Vec::new()
             }
             Event::Metering(metering) => {
+                self.metering_usage = Some(KiroMeteringUsage {
+                    credits: metering.usage,
+                    input_tokens: metering.input_tokens,
+                    output_tokens: metering.output_tokens,
+                });
                 tracing::info!(
                     usage = metering.usage,
                     input_tokens = metering.input_tokens,
@@ -1174,6 +1225,7 @@ impl StreamContext {
                     final_input_tokens,
                     self.output_tokens,
                     self.cache_usage.as_ref(),
+                    self.metering_usage.as_ref(),
                 ),
         );
         events
@@ -1271,6 +1323,7 @@ impl BufferedStreamContext {
                             usage["cache_creation_input_tokens"] =
                                 serde_json::json!(cache_usage.cache_write_input_tokens);
                         }
+                        add_kiro_metering_usage(usage, self.inner.metering_usage.as_ref());
                     }
                 }
             }
@@ -1379,6 +1432,59 @@ mod tests {
             10
         );
         assert_eq!(message_delta.data["usage"]["input_tokens"], 12);
+    }
+
+    fn assert_kiro_metering_usage(usage: &serde_json::Value) {
+        assert_eq!(usage["upstream_kiro_credits"], 1.25);
+        assert_eq!(usage["upstream_kiro_input_tokens"], 100);
+        assert_eq!(usage["upstream_kiro_output_tokens"], 20);
+    }
+
+    #[test]
+    fn test_metering_usage_in_message_delta() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
+        let mut events = ctx.generate_initial_events();
+
+        events.extend(ctx.process_assistant_response("OK"));
+        // meteringEvent usually arrives near the end, before final message_delta generation.
+        events.extend(ctx.process_kiro_event(&Event::Metering(
+            crate::kiro::model::events::MeteringEvent {
+                usage: Some(1.25),
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+            },
+        )));
+        events.extend(ctx.generate_final_events());
+
+        let message_delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta event");
+
+        assert_kiro_metering_usage(&message_delta.data["usage"]);
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 12);
+    }
+
+    #[test]
+    fn test_buffered_stream_metering_usage_in_message_start() {
+        let mut ctx = BufferedStreamContext::new("test-model", 12, false, HashMap::new());
+
+        ctx.process_and_buffer(&Event::Metering(
+            crate::kiro::model::events::MeteringEvent {
+                usage: Some(1.25),
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+            },
+        ));
+        let events = ctx.finish_and_get_all_events();
+
+        let message_start = events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .expect("should have message_start event");
+
+        assert_kiro_metering_usage(&message_start.data["message"]["usage"]);
+        assert_eq!(message_start.data["message"]["usage"]["input_tokens"], 12);
     }
 
     #[test]
