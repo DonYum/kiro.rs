@@ -838,7 +838,7 @@ impl MultiTokenManager {
         }
 
         let credentials = self.credential_for_id(entry.credential_id, model)?;
-        tracing::debug!(
+        tracing::info!(
             session_hash = %Self::sticky_key_short(&sticky_key),
             credential_id = entry.credential_id,
             "Kiro sticky session hit"
