@@ -4,14 +4,78 @@
 
 use serde::{Deserialize, Serialize};
 
+/// 工具数组条目
+///
+/// Kiro tools 数组可以同时包含工具定义和缓存断点。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Tool {
+    /// 工具规范条目
+    Specification(ToolDefinition),
+    /// 缓存断点条目
+    CachePoint(CachePointTool),
+}
+
+impl Tool {
+    /// 创建工具定义条目
+    pub fn specification(tool_specification: ToolSpecification) -> Self {
+        Self::Specification(ToolDefinition { tool_specification })
+    }
+
+    /// 创建默认缓存断点条目
+    pub fn cache_point_default() -> Self {
+        Self::CachePoint(CachePointTool {
+            cache_point: CachePoint::default_marker(),
+        })
+    }
+
+    /// 返回工具名称；缓存断点没有名称
+    pub fn tool_name(&self) -> Option<&str> {
+        match self {
+            Self::Specification(tool) => Some(tool.tool_specification.name.as_str()),
+            Self::CachePoint(_) => None,
+        }
+    }
+
+    /// 是否为缓存断点
+    pub fn is_cache_point(&self) -> bool {
+        matches!(self, Self::CachePoint(_))
+    }
+}
+
 /// 工具定义
 ///
 /// 用于在请求中定义可用的工具
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Tool {
+pub struct ToolDefinition {
     /// 工具规范
     pub tool_specification: ToolSpecification,
+}
+
+/// Kiro prompt cache 断点
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachePointTool {
+    /// 缓存断点定义
+    pub cache_point: CachePoint,
+}
+
+/// Kiro prompt cache 断点配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachePoint {
+    /// 断点类型
+    pub r#type: String,
+}
+
+impl CachePoint {
+    /// KiroProxy 参考实现使用 default 类型
+    pub fn default_marker() -> Self {
+        Self {
+            r#type: "default".to_string(),
+        }
+    }
 }
 
 /// 工具规范
@@ -188,5 +252,28 @@ mod tests {
     fn test_input_schema_default() {
         let schema = InputSchema::default();
         assert_eq!(schema.json["type"], "object");
+    }
+
+    #[test]
+    fn test_tool_specification_serializes_as_kiro_tool_entry() {
+        let tool = Tool::specification(ToolSpecification {
+            name: "Read".to_string(),
+            description: "Read files".to_string(),
+            input_schema: InputSchema::default(),
+        });
+
+        let value = serde_json::to_value(&tool).unwrap();
+        assert!(value.get("toolSpecification").is_some());
+        assert_eq!(value["toolSpecification"]["name"], "Read");
+    }
+
+    #[test]
+    fn test_cache_point_serializes_as_kiro_tool_entry() {
+        let tool = Tool::cache_point_default();
+
+        let value = serde_json::to_value(&tool).unwrap();
+        assert_eq!(value["cachePoint"]["type"], "default");
+        assert!(tool.is_cache_point());
+        assert_eq!(tool.tool_name(), None);
     }
 }

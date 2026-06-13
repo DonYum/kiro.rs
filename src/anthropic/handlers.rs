@@ -3,7 +3,7 @@
 use std::convert::Infallible;
 
 use anyhow::Error;
-use crate::kiro::model::events::Event;
+use crate::kiro::model::events::{Event, TokenUsage};
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request, request_fingerprint};
 use super::middleware::AppState;
-use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::stream::{BufferedStreamContext, KiroMeteringUsage, SseEvent, StreamContext, add_kiro_metering_usage};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
 
@@ -472,6 +472,42 @@ fn create_sse_stream(
 
 use super::converter::get_context_window_size;
 
+fn add_anthropic_cache_usage(
+    usage: &mut serde_json::Value,
+    cache_usage: Option<&TokenUsage>,
+) {
+    let Some(cache_usage) = cache_usage else {
+        return;
+    };
+    let Some(obj) = usage.as_object_mut() else {
+        return;
+    };
+
+    obj.insert(
+        "cache_read_input_tokens".to_string(),
+        json!(cache_usage.cache_read_input_tokens),
+    );
+    obj.insert(
+        "cache_creation_input_tokens".to_string(),
+        json!(cache_usage.cache_write_input_tokens),
+    );
+}
+
+fn build_anthropic_response_usage(
+    input_tokens: i32,
+    output_tokens: i32,
+    cache_usage: Option<&TokenUsage>,
+    metering_usage: Option<&KiroMeteringUsage>,
+) -> serde_json::Value {
+    let mut usage = json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens
+    });
+    add_anthropic_cache_usage(&mut usage, cache_usage);
+    add_kiro_metering_usage(&mut usage, metering_usage);
+    usage
+}
+
 /// 处理非流式请求
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -515,6 +551,8 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    let mut cache_usage: Option<TokenUsage> = None;
+    let mut metering_usage: Option<KiroMeteringUsage> = None;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -583,6 +621,29 @@ async fn handle_non_stream_request(
                                 actual_input_tokens
                             );
                         }
+                        Event::Metadata(metadata) => {
+                            if let Some(token_usage) = metadata.token_usage {
+                                cache_usage = Some(token_usage.clone());
+                                tracing::debug!(
+                                    cache_read_input_tokens = token_usage.cache_read_input_tokens,
+                                    cache_write_input_tokens = token_usage.cache_write_input_tokens,
+                                    "收到 Kiro tokenUsage cache 字段"
+                                );
+                            }
+                        }
+                        Event::Metering(metering) => {
+                            metering_usage = Some(KiroMeteringUsage {
+                                credits: metering.usage,
+                                input_tokens: metering.input_tokens,
+                                output_tokens: metering.output_tokens,
+                            });
+                            tracing::info!(
+                                usage = metering.usage,
+                                input_tokens = metering.input_tokens,
+                                output_tokens = metering.output_tokens,
+                                "收到 Kiro meteringEvent credits 字段"
+                            );
+                        }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
@@ -639,6 +700,13 @@ async fn handle_non_stream_request(
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
 
+    let usage = build_anthropic_response_usage(
+        final_input_tokens,
+        output_tokens,
+        cache_usage.as_ref(),
+        metering_usage.as_ref(),
+    );
+
     // 构建 Anthropic 响应
     let response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
@@ -648,10 +716,7 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
-        }
+        "usage": usage
     });
 
     (StatusCode::OK, Json(response_body)).into_response()
@@ -973,4 +1038,31 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_non_stream_usage_includes_kiro_metering_fields() {
+        let usage = build_anthropic_response_usage(
+            12,
+            3,
+            None,
+            Some(&KiroMeteringUsage {
+                credits: Some(1.25),
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+            }),
+        );
+
+        assert_eq!(usage["input_tokens"], 12);
+        assert_eq!(usage["output_tokens"], 3);
+        assert_eq!(usage["upstream_kiro_credits"], 1.25);
+        assert_eq!(usage["upstream_kiro_input_tokens"], 100);
+        assert_eq!(usage["upstream_kiro_output_tokens"], 20);
+        assert!(usage.get("cache_read_input_tokens").is_none());
+        assert!(usage.get("cache_creation_input_tokens").is_none());
+    }
 }
