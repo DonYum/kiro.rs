@@ -526,12 +526,22 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 会话到凭据的进程内粘性映射，key 为 session UUID 的哈希值。
+    sticky_sessions: Mutex<HashMap<String, StickySessionEntry>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+/// 会话账号粘性的内存 TTL。只用于进程内路由，不持久化。
+const STICKY_SESSION_TTL: StdDuration = StdDuration::from_secs(30 * 60);
+
+#[derive(Clone)]
+struct StickySessionEntry {
+    credential_id: u64,
+    expires_at: Instant,
+}
 
 /// API 调用上下文
 ///
@@ -655,6 +665,7 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            sticky_sessions: Mutex::new(HashMap::new()),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -721,24 +732,168 @@ impl MultiTokenManager {
             return None;
         }
 
+        let min_priority = available
+            .iter()
+            .map(|e| e.credentials.priority)
+            .min()
+            .unwrap();
+        let normal_pool: Vec<_> = available
+            .into_iter()
+            .filter(|e| e.credentials.priority == min_priority)
+            .collect();
         let mode = self.load_balancing_mode.lock().clone();
         let mode = mode.as_str();
 
         match mode {
             "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
-                let entry = available
-                    .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
+                // Least-Used 策略：仅在当前最高优先级可用池内均衡。
+                // 低优先级账号只在高优先级池不可用时作为 fallback。
+                let entry = normal_pool.iter().min_by_key(|e| e.success_count)?;
 
                 Some((entry.id, entry.credentials.clone()))
             }
             _ => {
                 // priority 模式（默认）：选择优先级最高的
-                let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
+                let entry = normal_pool.first()?;
                 Some((entry.id, entry.credentials.clone()))
             }
+        }
+    }
+
+    fn model_supported(credentials: &KiroCredentials, model: Option<&str>) -> bool {
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+        !is_opus || credentials.supports_opus()
+    }
+
+    fn is_normal_priority(&self, id: u64, model: Option<&str>) -> bool {
+        let entries = self.entries.lock();
+        let min_priority = entries
+            .iter()
+            .filter(|e| !e.disabled && Self::model_supported(&e.credentials, model))
+            .map(|e| e.credentials.priority)
+            .min();
+
+        match min_priority {
+            Some(min_priority) => entries.iter().any(|e| {
+                e.id == id
+                    && !e.disabled
+                    && Self::model_supported(&e.credentials, model)
+                    && e.credentials.priority == min_priority
+            }),
+            None => false,
+        }
+    }
+
+    fn sticky_key(session_id: &str) -> String {
+        sha256_hex(session_id)
+    }
+
+    fn sticky_key_short(sticky_key: &str) -> &str {
+        sticky_key.get(..12).unwrap_or(sticky_key)
+    }
+
+    fn credential_for_id(&self, id: u64, model: Option<&str>) -> Option<KiroCredentials> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|e| e.id == id && !e.disabled && Self::model_supported(&e.credentials, model))
+            .map(|e| e.credentials.clone())
+    }
+
+    fn cleanup_expired_sticky_sessions(&self, now: Instant) {
+        let mut sessions = self.sticky_sessions.lock();
+        sessions.retain(|_, entry| entry.expires_at > now);
+    }
+
+    fn lookup_sticky_credential(
+        &self,
+        session_id: Option<&str>,
+        model: Option<&str>,
+        now: Instant,
+    ) -> Option<(u64, KiroCredentials)> {
+        let session_id = session_id?;
+        let sticky_key = Self::sticky_key(session_id);
+        let entry = {
+            let mut sessions = self.sticky_sessions.lock();
+            match sessions.get(&sticky_key).cloned() {
+                Some(entry) if entry.expires_at > now => Some(entry),
+                Some(_) => {
+                    sessions.remove(&sticky_key);
+                    None
+                }
+                None => None,
+            }
+        }?;
+
+        if !self.is_normal_priority(entry.credential_id, model) {
+            self.remove_sticky_session_by_key(&sticky_key);
+            tracing::info!(
+                session_hash = %Self::sticky_key_short(&sticky_key),
+                credential_id = entry.credential_id,
+                "Kiro sticky session unbound because credential is no longer in normal priority pool"
+            );
+            return None;
+        }
+
+        let credentials = self.credential_for_id(entry.credential_id, model)?;
+        tracing::info!(
+            session_hash = %Self::sticky_key_short(&sticky_key),
+            credential_id = entry.credential_id,
+            "Kiro sticky session hit"
+        );
+        Some((entry.credential_id, credentials))
+    }
+
+    fn bind_sticky_session(
+        &self,
+        session_id: Option<&str>,
+        credential_id: u64,
+        model: Option<&str>,
+        now: Instant,
+    ) {
+        let session_id = match session_id {
+            Some(session_id) => session_id,
+            None => return,
+        };
+
+        if !self.is_normal_priority(credential_id, model) {
+            return;
+        }
+
+        let sticky_key = Self::sticky_key(session_id);
+        let mut sessions = self.sticky_sessions.lock();
+        sessions.insert(
+            sticky_key.clone(),
+            StickySessionEntry {
+                credential_id,
+                expires_at: now + STICKY_SESSION_TTL,
+            },
+        );
+        tracing::info!(
+            session_hash = %Self::sticky_key_short(&sticky_key),
+            credential_id,
+            ttl_secs = STICKY_SESSION_TTL.as_secs(),
+            "Kiro sticky session bound"
+        );
+    }
+
+    fn remove_sticky_session_by_key(&self, sticky_key: &str) {
+        self.sticky_sessions.lock().remove(sticky_key);
+    }
+
+    fn remove_sticky_sessions_for_credential(&self, credential_id: u64) {
+        let mut sessions = self.sticky_sessions.lock();
+        let before = sessions.len();
+        sessions.retain(|_, entry| entry.credential_id != credential_id);
+        let removed = before.saturating_sub(sessions.len());
+        if removed > 0 {
+            tracing::info!(
+                credential_id,
+                removed,
+                "Kiro sticky sessions unbound for credential"
+            );
         }
     }
 
@@ -753,6 +908,17 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+        self.acquire_context_for_session(model, None).await
+    }
+
+    /// 获取带会话粘性的 API 调用上下文。
+    ///
+    /// `session_id` 为空时保持原有 balanced/priority 行为。
+    pub async fn acquire_context_for_session(
+        &self,
+        model: Option<&str>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -767,60 +933,74 @@ impl MultiTokenManager {
             }
 
             let (id, credentials) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+                let now = Instant::now();
+                self.cleanup_expired_sticky_sessions(now);
 
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
-                    None
-                } else {
-                    let entries = self.entries.lock();
-                    let current_id = *self.current_id.lock();
-                    entries
-                        .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
-                        .map(|e| (e.id, e.credentials.clone()))
-                };
-
-                if let Some(hit) = current_hit {
+                if let Some(hit) = self.lookup_sticky_credential(session_id, model, now) {
                     hit
                 } else {
-                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model);
+                    let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
-                    // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
-                    if best.is_none() {
-                        let mut entries = self.entries.lock();
-                        if entries.iter().any(|e| {
-                            e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
-                        }) {
-                            tracing::warn!(
-                                "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
-                            );
-                            for e in entries.iter_mut() {
-                                if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
-                                    e.disabled = false;
-                                    e.disabled_reason = None;
-                                    e.failure_count = 0;
-                                }
-                            }
-                            drop(entries);
-                            best = self.select_next_credential(model);
-                        }
-                    }
-
-                    if let Some((new_id, new_creds)) = best {
-                        // 更新 current_id
-                        let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
-                        (new_id, new_creds)
+                    // balanced 模式：每次请求都重新均衡选择，不固定 current_id
+                    // priority 模式：优先使用 current_id 指向的凭据
+                    let current_hit = if is_balanced {
+                        None
                     } else {
                         let entries = self.entries.lock();
-                        // 注意：必须在 bail! 之前计算 available_count，
-                        // 因为 available_count() 会尝试获取 entries 锁，
-                        // 而此时我们已经持有该锁，会导致死锁
-                        let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                        let current_id = *self.current_id.lock();
+                        entries
+                            .iter()
+                            .find(|e| {
+                                e.id == current_id
+                                    && !e.disabled
+                                    && Self::model_supported(&e.credentials, model)
+                            })
+                            .map(|e| (e.id, e.credentials.clone()))
+                    };
+
+                    if let Some(hit) = current_hit {
+                        hit
+                    } else {
+                        // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
+                        let mut best = self.select_next_credential(model);
+
+                        // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
+                        if best.is_none() {
+                            let mut entries = self.entries.lock();
+                            if entries.iter().any(|e| {
+                                e.disabled
+                                    && e.disabled_reason == Some(DisabledReason::TooManyFailures)
+                            }) {
+                                tracing::warn!(
+                                    "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
+                                );
+                                for e in entries.iter_mut() {
+                                    if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
+                                        e.disabled = false;
+                                        e.disabled_reason = None;
+                                        e.failure_count = 0;
+                                    }
+                                }
+                                drop(entries);
+                                best = self.select_next_credential(model);
+                            }
+                        }
+
+                        if let Some((new_id, new_creds)) = best {
+                            // 更新 current_id
+                            let mut current_id = self.current_id.lock();
+                            *current_id = new_id;
+                            drop(current_id);
+                            self.bind_sticky_session(session_id, new_id, model, now);
+                            (new_id, new_creds)
+                        } else {
+                            let entries = self.entries.lock();
+                            // 注意：必须在 bail! 之前计算 available_count，
+                            // 因为 available_count() 会尝试获取 entries 锁，
+                            // 而此时我们已经持有该锁，会导致死锁
+                            let available = entries.iter().filter(|e| !e.disabled).count();
+                            anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                        }
                     }
                 }
             };
@@ -840,6 +1020,7 @@ impl MultiTokenManager {
                             tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
                             self.report_refresh_failure(id)
                         };
+                    self.remove_sticky_sessions_for_credential(id);
                     attempt_count += 1;
                     if !has_available {
                         anyhow::bail!("所有凭据均已禁用（0/{}）", total);
@@ -1150,7 +1331,7 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_failure(&self, id: u64) -> bool {
-        let result = {
+        let (result, disabled_now) = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
@@ -1174,7 +1355,7 @@ impl MultiTokenManager {
                 MAX_FAILURES_PER_CREDENTIAL
             );
 
-            if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
+            let disabled_now = if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::TooManyFailures);
                 tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
@@ -1194,10 +1375,16 @@ impl MultiTokenManager {
                 } else {
                     tracing::error!("所有凭据均已禁用！");
                 }
-            }
+                true
+            } else {
+                false
+            };
 
-            entries.iter().any(|e| !e.disabled)
+            (entries.iter().any(|e| !e.disabled), disabled_now)
         };
+        if disabled_now {
+            self.remove_sticky_sessions_for_credential(id);
+        }
         self.save_stats_debounced();
         result
     }
@@ -1248,6 +1435,7 @@ impl MultiTokenManager {
                 false
             }
         };
+        self.remove_sticky_sessions_for_credential(id);
         self.save_stats_debounced();
         result
     }
@@ -1311,6 +1499,7 @@ impl MultiTokenManager {
                 false
             }
         };
+        self.remove_sticky_sessions_for_credential(id);
         self.save_stats_debounced();
         result
     }
@@ -1359,6 +1548,7 @@ impl MultiTokenManager {
                 false
             }
         };
+        self.remove_sticky_sessions_for_credential(id);
         self.save_stats_debounced();
         result
     }
@@ -1480,6 +1670,9 @@ impl MultiTokenManager {
                 entry.disabled_reason = Some(DisabledReason::Manual);
             }
         }
+        if disabled {
+            self.remove_sticky_sessions_for_credential(id);
+        }
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
@@ -1498,6 +1691,7 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.credentials.priority = priority;
         }
+        self.remove_sticky_sessions_for_credential(id);
         // 立即按新优先级重新选择当前凭据（无论持久化是否成功）
         self.select_highest_priority();
         // 持久化更改
@@ -1825,6 +2019,8 @@ impl MultiTokenManager {
 
         // 持久化更改
         self.persist_credentials()?;
+
+        self.remove_sticky_sessions_for_credential(id);
 
         // 立即回写统计数据，清除已删除凭据的残留条目
         self.save_stats();
@@ -2209,6 +2405,145 @@ mod tests {
         let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
         assert_eq!(manager.total_count(), 1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    fn valid_test_credential(token: &str, priority: u32) -> KiroCredentials {
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some(token.to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        cred.priority = priority;
+        cred
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_for_session_sticks_to_first_credential() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_test_credential("token-1", 0),
+                valid_test_credential("token-2", 0),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let first = manager
+            .acquire_context_for_session(None, Some("session-a"))
+            .await
+            .unwrap();
+        manager.report_success(first.id);
+
+        let second = manager
+            .acquire_context_for_session(None, Some("session-a"))
+            .await
+            .unwrap();
+
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.token, first.token);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_for_session_balances_new_sessions() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_test_credential("token-1", 0),
+                valid_test_credential("token-2", 0),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let first = manager
+            .acquire_context_for_session(None, Some("session-a"))
+            .await
+            .unwrap();
+        manager.report_success(first.id);
+
+        let second = manager
+            .acquire_context_for_session(None, Some("session-b"))
+            .await
+            .unwrap();
+
+        assert_ne!(second.id, first.id);
+    }
+
+    #[tokio::test]
+    async fn test_balanced_uses_low_priority_only_after_normal_pool_unavailable() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_test_credential("primary-1", 0),
+                valid_test_credential("primary-2", 0),
+                valid_test_credential("fallback", 5),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let first = manager.acquire_context_for_session(None, None).await.unwrap();
+        manager.report_success(first.id);
+        let second = manager.acquire_context_for_session(None, None).await.unwrap();
+        manager.report_success(second.id);
+        let third = manager.acquire_context_for_session(None, None).await.unwrap();
+
+        assert!(matches!(first.id, 1 | 2));
+        assert!(matches!(second.id, 1 | 2));
+        assert!(matches!(third.id, 1 | 2));
+        assert_ne!(first.id, second.id);
+
+        manager.report_quota_exhausted(1);
+        manager.report_quota_exhausted(2);
+
+        let fallback = manager.acquire_context_for_session(None, None).await.unwrap();
+        assert_eq!(fallback.id, 3);
+    }
+
+    #[tokio::test]
+    async fn test_sticky_unbinds_when_credential_disabled() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_test_credential("token-1", 0),
+                valid_test_credential("token-2", 0),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let first = manager
+            .acquire_context_for_session(None, Some("session-a"))
+            .await
+            .unwrap();
+
+        manager.set_disabled(first.id, true).unwrap();
+
+        let next = manager
+            .acquire_context_for_session(None, Some("session-a"))
+            .await
+            .unwrap();
+
+        assert_ne!(next.id, first.id);
     }
 
     #[test]

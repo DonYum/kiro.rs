@@ -21,7 +21,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request, request_fingerprint};
+use super::converter::{ConversionError, convert_request, extract_session_id, request_fingerprint};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, KiroMeteringUsage, SseEvent, StreamContext, add_kiro_metering_usage};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
@@ -241,6 +241,11 @@ pub async fn post_messages(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
     request_fingerprint(&payload);
+    let sticky_session_id = payload
+        .metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_deref())
+        .and_then(extract_session_id);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -327,12 +332,22 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            sticky_session_id.as_deref(),
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            sticky_session_id.as_deref(),
+        )
+        .await
     }
 }
 
@@ -344,9 +359,13 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    sticky_session_id: Option<&str>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let response = match provider
+        .call_api_stream_for_session(request_body, sticky_session_id)
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -516,9 +535,13 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    sticky_session_id: Option<&str>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let response = match provider
+        .call_api_for_session(request_body, sticky_session_id)
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -820,6 +843,11 @@ pub async fn post_messages_cc(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
     request_fingerprint(&payload);
+    let sticky_session_id = payload
+        .metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_deref())
+        .and_then(extract_session_id);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -906,12 +934,22 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            sticky_session_id.as_deref(),
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            sticky_session_id.as_deref(),
+        )
+        .await
     }
 }
 
@@ -926,9 +964,13 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    sticky_session_id: Option<&str>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let response = match provider
+        .call_api_stream_for_session(request_body, sticky_session_id)
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
