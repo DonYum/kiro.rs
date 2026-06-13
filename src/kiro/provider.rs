@@ -323,7 +323,10 @@ impl KiroProvider {
             let body = endpoint.transform_api_body(request_body, &rctx);
 
             tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
+            #[cfg(feature = "sensitive-logs")]
             tracing::debug!("实际发送请求体: {}", body);
+            #[cfg(not(feature = "sensitive-logs"))]
+            tracing::debug!("实际发送请求体长度: {} bytes", body.len());
 
             let base = self
                 .client_for(&ctx.credentials)?
