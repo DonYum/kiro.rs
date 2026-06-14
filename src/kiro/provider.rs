@@ -289,10 +289,15 @@ impl KiroProvider {
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
+        let session_id = Self::extract_session_id_from_request(request_body);
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context_for_session(model.as_deref(), session_id.as_deref())
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -519,6 +524,20 @@ impl KiroProvider {
             .map(|s| s.to_string())
     }
 
+    /// 从请求体中提取会话 ID。
+    ///
+    /// 这里使用转换后的 Kiro `conversationId`，避免重复解析 Anthropic metadata。
+    fn extract_session_id_from_request(request_body: &str) -> Option<String> {
+        use serde_json::Value;
+
+        let json: Value = serde_json::from_str(request_body).ok()?;
+
+        json.get("conversationState")?
+            .get("conversationId")?
+            .as_str()
+            .map(|s| s.to_string())
+    }
+
     fn retry_delay(attempt: usize) -> Duration {
         // 指数退避 + 少量抖动，避免上游抖动时放大故障
         const BASE_MS: u64 = 200;
@@ -528,5 +547,29 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_session_id_from_request() {
+        let body = r#"{"conversationState":{"conversationId":"conv-123"}}"#;
+
+        assert_eq!(
+            KiroProvider::extract_session_id_from_request(body),
+            Some("conv-123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_session_id_from_request_missing_or_invalid() {
+        assert_eq!(
+            KiroProvider::extract_session_id_from_request(r#"{"conversationState":{}}"#),
+            None
+        );
+        assert_eq!(KiroProvider::extract_session_id_from_request("not-json"), None);
     }
 }
