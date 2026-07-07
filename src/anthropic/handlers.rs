@@ -21,6 +21,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
+use super::cache_tracker::{CacheContext, PromptCacheUsage, build_usage_json};
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
@@ -303,10 +304,22 @@ pub async fn post_messages(
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
     ) as i32;
+
+    // 构建缓存画像（请求无 cache_control 断点时为 None，usage 不附加 cache 字段）
+    let cache_context = state
+        .cache_tracker
+        .build_claude_profile(&payload)
+        .map(|mut profile| {
+            profile.raise_total_input_tokens(input_tokens);
+            CacheContext {
+                tracker: state.cache_tracker.clone(),
+                profile: std::sync::Arc::new(profile),
+            }
+        });
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -326,12 +339,13 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            cache_context,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, cache_context).await
     }
 }
 
@@ -343,9 +357,10 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    cache_context: Option<CacheContext>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let result = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -353,11 +368,25 @@ async fn handle_stream_request(
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
 
+    // 依据实际使用的凭据计算模拟缓存使用量，并登记本次请求的指纹。
+    //
+    // Tradeoff（有意区别于 Kiro-Go 的流结束后登记）：在上游返回 2xx 后、
+    // 响应流开始前立即登记，同会话紧随的并发请求能立刻命中指纹；代价是
+    // 若之后流中断或 200 内含错误事件，本次前缀仍被视为已缓存，下次请求
+    // 会被模拟成 cache hit（计费偏少）。这是账面模拟而非真实缓存，上游
+    // 已接受请求时前缀大概率已进入其缓存，偏差方向对用户有利，可接受。
+    // 若要保守计费（宁多算不少算），应把 update 延迟到流成功结束后。
+    if let Some(cc) = &cache_context {
+        let usage = cc.tracker.compute(result.credential_id, &cc.profile);
+        cc.tracker.update(result.credential_id, &cc.profile);
+        ctx.cache_usage = Some(usage);
+    }
+
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
+    let stream = create_sse_stream(result.response, ctx, initial_events);
 
     // 返回 SSE 响应
     Response::builder()
@@ -479,15 +508,24 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    cache_context: Option<CacheContext>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let result = match provider.call_api(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
 
+    // 依据实际使用的凭据计算模拟缓存使用量并登记指纹。
+    // 登记时机与流式路径一致（2xx 即登记，见 handle_stream_request 的 tradeoff 注释）。
+    let cache_usage: Option<PromptCacheUsage> = cache_context.as_ref().map(|cc| {
+        let usage = cc.tracker.compute(result.credential_id, &cc.profile);
+        cc.tracker.update(result.credential_id, &cc.profile);
+        usage
+    });
+
     // 读取响应体
-    let body_bytes = match response.bytes().await {
+    let body_bytes = match result.response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!("读取响应体失败: {}", e);
@@ -647,10 +685,7 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
-        }
+        "usage": build_usage_json(final_input_tokens, output_tokens, cache_usage.as_ref())
     });
 
     (StatusCode::OK, Json(response_body)).into_response()
@@ -816,10 +851,22 @@ pub async fn post_messages_cc(
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
     ) as i32;
+
+    // 构建缓存画像（请求无 cache_control 断点时为 None，usage 不附加 cache 字段）
+    let cache_context = state
+        .cache_tracker
+        .build_claude_profile(&payload)
+        .map(|mut profile| {
+            profile.raise_total_input_tokens(input_tokens);
+            CacheContext {
+                tracker: state.cache_tracker.clone(),
+                profile: std::sync::Arc::new(profile),
+            }
+        });
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -839,12 +886,13 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            cache_context,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, cache_context).await
     }
 }
 
@@ -859,18 +907,27 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    cache_context: Option<CacheContext>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let result = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+
+    // 依据实际使用的凭据计算模拟缓存使用量并登记指纹。
+    // 登记时机与 handle_stream_request 一致（2xx 即登记，tradeoff 见彼处注释）。
+    if let Some(cc) = &cache_context {
+        let usage = cc.tracker.compute(result.credential_id, &cc.profile);
+        cc.tracker.update(result.credential_id, &cc.profile);
+        ctx.set_cache_usage(usage);
+    }
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx);
+    let stream = create_buffered_sse_stream(result.response, ctx);
 
     // 返回 SSE 响应
     Response::builder()

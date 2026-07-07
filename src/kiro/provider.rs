@@ -25,6 +25,15 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
 
+/// API 调用结果：响应 + 实际使用的凭据 ID
+///
+/// 凭据 ID 用于缓存指纹追踪——模拟的 prompt cache 按凭据隔离，
+/// 调用方需要知道这次请求最终落在哪个凭据上。
+pub struct ApiCallResult {
+    pub response: reqwest::Response,
+    pub credential_id: u64,
+}
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -111,12 +120,13 @@ impl KiroProvider {
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
-    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    /// 返回响应及实际使用的凭据 ID（用于按凭据维护缓存指纹表）
+    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<ApiCallResult> {
         self.call_api_with_retry(request_body, false).await
     }
 
     /// 发送流式 API 请求
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<ApiCallResult> {
         self.call_api_with_retry(request_body, true).await
     }
 
@@ -280,7 +290,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<ApiCallResult> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -289,10 +299,15 @@ impl KiroProvider {
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
+        let session_id = Self::extract_session_id_from_request(request_body);
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context_for_session(model.as_deref(), session_id.as_deref())
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -354,7 +369,10 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                return Ok(ApiCallResult {
+                    response,
+                    credential_id: ctx.id,
+                });
             }
 
             // 失败响应：读取 body 用于日志/错误信息
@@ -506,6 +524,20 @@ impl KiroProvider {
             .map(|s| s.to_string())
     }
 
+    /// 从请求体中提取会话 ID。
+    ///
+    /// 这里使用转换后的 Kiro `conversationId`，避免重复解析 Anthropic metadata。
+    fn extract_session_id_from_request(request_body: &str) -> Option<String> {
+        use serde_json::Value;
+
+        let json: Value = serde_json::from_str(request_body).ok()?;
+
+        json.get("conversationState")?
+            .get("conversationId")?
+            .as_str()
+            .map(|s| s.to_string())
+    }
+
     fn retry_delay(attempt: usize) -> Duration {
         // 指数退避 + 少量抖动，避免上游抖动时放大故障
         const BASE_MS: u64 = 200;
@@ -515,5 +547,29 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_session_id_from_request() {
+        let body = r#"{"conversationState":{"conversationId":"conv-123"}}"#;
+
+        assert_eq!(
+            KiroProvider::extract_session_id_from_request(body),
+            Some("conv-123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_session_id_from_request_missing_or_invalid() {
+        assert_eq!(
+            KiroProvider::extract_session_id_from_request(r#"{"conversationState":{}}"#),
+            None
+        );
+        assert_eq!(KiroProvider::extract_session_id_from_request("not-json"), None);
     }
 }
