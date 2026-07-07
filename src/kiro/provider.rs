@@ -407,8 +407,35 @@ impl KiroProvider {
                 continue;
             }
 
-            // 400 Bad Request - 请求问题，重试/切换凭据无意义
+            // 400 Bad Request - 大部分是请求问题；INVALID_MODEL_ID 是凭据级模型权限问题
             if status.as_u16() == 400 {
+                if Self::is_invalid_model_id(&body) {
+                    tracing::warn!(
+                        "API 请求失败（当前凭据无此模型权限，尝试切换凭据，尝试 {}/{}）: {} {}",
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+
+                    let has_available = self.token_manager.report_failure(ctx.id);
+                    if !has_available {
+                        anyhow::bail!(
+                            "{} API 请求失败（所有凭据均不支持该模型或已不可用）: {} {}",
+                            api_type,
+                            status,
+                            body
+                        );
+                    }
+
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ));
+                    continue;
+                }
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -538,6 +565,15 @@ impl KiroProvider {
             .map(|s| s.to_string())
     }
 
+    /// 检测是否为「模型 ID 无权限/不可用」类错误。
+    ///
+    /// Kiro 会用 400 + INVALID_MODEL_ID 表示当前凭据没有该模型权限。这是凭据级能力
+    /// 差异，不代表请求体一定无效，因此应给其他凭据一次故障转移机会。
+    fn is_invalid_model_id(body: &str) -> bool {
+        let lower = body.to_ascii_lowercase();
+        lower.contains("invalid_model_id") || lower.contains("invalid model")
+    }
+
     fn retry_delay(attempt: usize) -> Duration {
         // 指数退避 + 少量抖动，避免上游抖动时放大故障
         const BASE_MS: u64 = 200;
@@ -571,5 +607,21 @@ mod tests {
             None
         );
         assert_eq!(KiroProvider::extract_session_id_from_request("not-json"), None);
+    }
+
+    #[test]
+    fn test_is_invalid_model_id_detects_reason_and_message() {
+        assert!(KiroProvider::is_invalid_model_id(
+            r#"{"message":"Model access denied","reason":"INVALID_MODEL_ID"}"#
+        ));
+        assert!(KiroProvider::is_invalid_model_id(
+            r#"{"error":{"message":"Invalid model: claude-sonnet-4"}}"#
+        ));
+        assert!(KiroProvider::is_invalid_model_id(
+            r#"{"message":"invalid MODEL for this credential"}"#
+        ));
+        assert!(!KiroProvider::is_invalid_model_id(
+            r#"{"message":"Improperly formed request","reason":"BAD_REQUEST"}"#
+        ));
     }
 }
