@@ -295,6 +295,7 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut failed_ids: Vec<u64> = Vec::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型信息
@@ -305,7 +306,11 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self
                 .token_manager
-                .acquire_context_for_session(model.as_deref(), session_id.as_deref())
+                .acquire_context_for_session_excluding(
+                    model.as_deref(),
+                    session_id.as_deref(),
+                    &failed_ids,
+                )
                 .await
             {
                 Ok(c) => c,
@@ -389,6 +394,9 @@ impl KiroProvider {
                 );
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                if !failed_ids.contains(&ctx.id) {
+                    failed_ids.push(ctx.id);
+                }
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
@@ -434,6 +442,9 @@ impl KiroProvider {
                 }
 
                 let has_available = self.token_manager.report_failure(ctx.id);
+                if !failed_ids.contains(&ctx.id) {
+                    failed_ids.push(ctx.id);
+                }
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
@@ -468,6 +479,9 @@ impl KiroProvider {
                     status,
                     body
                 ));
+                if !failed_ids.contains(&ctx.id) {
+                    failed_ids.push(ctx.id);
+                }
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -493,6 +507,9 @@ impl KiroProvider {
                 status,
                 body
             ));
+            if !failed_ids.contains(&ctx.id) {
+                failed_ids.push(ctx.id);
+            }
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }

@@ -708,7 +708,11 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    fn select_next_credential_excluding(
+        &self,
+        model: Option<&str>,
+        exclude_ids: &[u64],
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
 
         // 检查是否是 opus 模型
@@ -721,6 +725,9 @@ impl MultiTokenManager {
             .iter()
             .filter(|e| {
                 if e.disabled {
+                    return false;
+                }
+                if exclude_ids.contains(&e.id) {
                     return false;
                 }
                 // 如果是 opus 模型，需要检查订阅等级
@@ -831,6 +838,7 @@ impl MultiTokenManager {
         &self,
         session_id: Option<&str>,
         model: Option<&str>,
+        exclude_ids: &[u64],
         now: Instant,
     ) -> Option<(u64, KiroCredentials)> {
         let session_id = session_id?;
@@ -849,6 +857,16 @@ impl MultiTokenManager {
                 None => None,
             }
         }?;
+
+        if exclude_ids.contains(&entry.credential_id) {
+            tracing::info!(
+                session_hash = %Self::sticky_key_short(&sticky_key),
+                credential_id = entry.credential_id,
+                selection_reason = "sticky_skipped_retry_excluded",
+                "Kiro sticky session skipped for this retry because credential already failed in request"
+            );
+            return None;
+        }
 
         if !self.is_normal_priority(entry.credential_id, model) {
             self.remove_sticky_session_by_key(&sticky_key);
@@ -968,6 +986,20 @@ impl MultiTokenManager {
         model: Option<&str>,
         session_id: Option<&str>,
     ) -> anyhow::Result<CallContext> {
+        self.acquire_context_for_session_excluding(model, session_id, &[])
+            .await
+    }
+
+    /// 获取带会话粘性的 API 调用上下文，并在本次请求重试链内临时排除指定凭据。
+    ///
+    /// `exclude_ids` 只影响当前选择，不清除 sticky 绑定；如果其他凭据成功，本轮会按
+    /// balanced 语义重绑，避免同一个请求反复打刚失败的凭据。
+    pub async fn acquire_context_for_session_excluding(
+        &self,
+        model: Option<&str>,
+        session_id: Option<&str>,
+        exclude_ids: &[u64],
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -987,7 +1019,8 @@ impl MultiTokenManager {
 
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
                 if is_balanced
-                    && let Some(hit) = self.lookup_sticky_credential(session_id, model, now)
+                    && let Some(hit) =
+                        self.lookup_sticky_credential(session_id, model, exclude_ids, now)
                 {
                     hit
                 } else {
@@ -1003,6 +1036,7 @@ impl MultiTokenManager {
                             .find(|e| {
                                 e.id == current_id
                                     && !e.disabled
+                                    && !exclude_ids.contains(&e.id)
                                     && Self::model_supported(&e.credentials, model)
                             })
                             .map(|e| (e.id, e.credentials.clone()))
@@ -1012,7 +1046,7 @@ impl MultiTokenManager {
                         hit
                     } else {
                         // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                        let mut best = self.select_next_credential(model);
+                        let mut best = self.select_next_credential_excluding(model, exclude_ids);
 
                         // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                         if best.is_none() {
@@ -1032,7 +1066,7 @@ impl MultiTokenManager {
                                     }
                                 }
                                 drop(entries);
-                                best = self.select_next_credential(model);
+                                best = self.select_next_credential_excluding(model, exclude_ids);
                             }
                         }
 
@@ -2580,6 +2614,38 @@ mod tests {
 
         assert_eq!(second.id, first.id);
         assert_eq!(second.token, first.token);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_for_session_excluding_skips_sticky_for_retry_only() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_test_credential("token-1", 0),
+                valid_test_credential("token-2", 0),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let first = manager
+            .acquire_context_for_session(None, Some("session-a"))
+            .await
+            .unwrap();
+        assert_eq!(first.id, 1);
+
+        let retry = manager
+            .acquire_context_for_session_excluding(None, Some("session-a"), &[first.id])
+            .await
+            .unwrap();
+
+        assert_eq!(retry.id, 2);
+        assert_eq!(manager.available_count(), 2);
     }
 
     #[tokio::test]
