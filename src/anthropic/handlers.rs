@@ -547,6 +547,9 @@ async fn handle_non_stream_request(
     }
 
     let mut text_content = String::new();
+    // reasoningContentEvent 累积（thinking 模型独立推理流），最终作为 thinking content block 返回
+    let mut reasoning_text = String::new();
+    let mut reasoning_signature: Option<String> = None;
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
@@ -564,6 +567,12 @@ async fn handle_non_stream_request(
                     match event {
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
+                        }
+                        Event::ReasoningContent(reasoning) => {
+                            reasoning_text.push_str(&reasoning.text);
+                            if let Some(sig) = reasoning.signature {
+                                reasoning_signature = Some(sig);
+                            }
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
@@ -644,14 +653,26 @@ async fn handle_non_stream_request(
     let mut content: Vec<serde_json::Value> = Vec::new();
 
     if thinking_enabled {
-        // 从完整文本中提取 thinking 块
-        let (thinking, remaining_text) =
+        // 从完整文本中提取内嵌 `<thinking>` XML 块（Q 上游非流式常把推理嵌在 assistant 文本里）
+        let (xml_thinking, remaining_text) =
             super::stream::extract_thinking_from_complete_text(&text_content);
 
-        if let Some(thinking_text) = thinking {
+        // 优先用独立 reasoningContentEvent 聚合的推理内容；没有再回退到 XML 提取。
+        // （新模型走 reasoningContentEvent，旧路径走内嵌 <thinking>，两者互斥。）
+        let final_thinking = if !reasoning_text.is_empty() {
+            Some(reasoning_text.clone())
+        } else {
+            xml_thinking
+        };
+
+        // thinking 块必须排在 text 之前（Anthropic 协议要求）。
+        // signature 字段必须存在：有上游 signature 用真实值（下一轮写回 history 才合法），
+        // 否则空串占位（客户端 SDK 接受）。
+        if let Some(thinking_text) = final_thinking {
             content.push(json!({
                 "type": "thinking",
-                "thinking": thinking_text
+                "thinking": thinking_text,
+                "signature": reasoning_signature.clone().unwrap_or_default()
             }));
         }
 
