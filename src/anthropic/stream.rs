@@ -1165,7 +1165,12 @@ impl StreamContext {
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
-        // 如果只有 reasoning 内容（没有后续 text/tool_use），在流结束前关闭 reasoning 块
+        // 如果只有 reasoning 内容（没有后续 text/tool_use），在流结束前关闭 reasoning 块。
+        // 注意：close_reasoning_if_open() 会清掉 thinking_block_index，
+        // 需先记录"是否产生过 thinking 块（reasoning 或老式 <thinking>）"，
+        // 供下方 thinking-only 终止语义判断，否则 reasoning-only 流会丢掉
+        // max_tokens stop_reason + 补 text block 的既有行为。
+        let had_thinking_block = self.thinking_block_index.is_some();
         events.extend(self.close_reasoning_if_open());
 
         // Flush thinking_buffer 中的剩余内容
@@ -1234,7 +1239,7 @@ impl StreamContext {
         // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
         // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
         if self.thinking_enabled
-            && self.thinking_block_index.is_some()
+            && (had_thinking_block || self.thinking_block_index.is_some())
             && !self.state_manager.has_non_thinking_blocks()
         {
             self.state_manager.set_stop_reason("max_tokens");
@@ -1380,6 +1385,62 @@ fn estimate_tokens(text: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// reasoning-only 流（只有 reasoningContentEvent，没有后续 text/tool_use）
+    /// 必须保留 thinking-only 终止语义：stop_reason=max_tokens + 补一个 text block。
+    /// close_reasoning_if_open() 会清 thinking_block_index，回归此前用 had_thinking_block 兜住。
+    #[test]
+    fn test_reasoning_only_sets_max_tokens_stop_reason() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_reasoning_content(
+            &crate::kiro::model::events::ReasoningContentEvent {
+                text: "abc".to_string(),
+                signature: Some("sig".to_string()),
+                redacted_content: None,
+            },
+        ));
+        all_events.extend(ctx.generate_final_events());
+
+        let message_delta = all_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta event");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "max_tokens");
+        assert!(all_events.iter().any(|e| {
+            e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
+        }));
+    }
+
+    /// reasoning 流：signature_delta 必须在 content_block_stop 之前发出（Anthropic 协议）。
+    #[test]
+    fn test_reasoning_signature_delta_before_stop() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let mut events = ctx.process_reasoning_content(
+            &crate::kiro::model::events::ReasoningContentEvent {
+                text: "reasoning".to_string(),
+                signature: Some("the-sig".to_string()),
+                redacted_content: None,
+            },
+        );
+        // 切到 text 流触发 close_reasoning_if_open
+        let assistant: crate::kiro::model::events::AssistantResponseEvent =
+            serde_json::from_value(json!({ "content": "answer" })).unwrap();
+        events.extend(ctx.process_kiro_event(&Event::AssistantResponse(assistant)));
+        let sig_pos = events.iter().position(|e| {
+            e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "signature_delta"
+        });
+        let stop_pos = events
+            .iter()
+            .position(|e| e.event == "content_block_stop");
+        assert!(sig_pos.is_some(), "should emit signature_delta");
+        assert!(stop_pos.is_some(), "should emit content_block_stop");
+        assert!(sig_pos < stop_pos, "signature_delta must precede content_block_stop");
+    }
 
     #[test]
     fn test_sse_event_format() {
