@@ -414,6 +414,10 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    metered_credits: f64,
+    metered_request_count: u64,
+    metering_started_at: Option<String>,
+    metering_baseline: Option<MeteringBaseline>,
 }
 
 /// 禁用原因
@@ -434,10 +438,36 @@ enum DisabledReason {
 }
 
 /// 统计数据持久化条目
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MeteringBaseline {
+    source_usage: f64,
+    local_credits: f64,
+    local_request_count: u64,
+    next_reset_at: Option<f64>,
+    created_at: String,
+}
+
 #[derive(Serialize, Deserialize)]
 struct StatsEntry {
     success_count: u64,
     last_used_at: Option<String>,
+    #[serde(default)]
+    metered_credits: f64,
+    #[serde(default)]
+    metered_request_count: u64,
+    #[serde(default)]
+    metering_started_at: Option<String>,
+    #[serde(default)]
+    metering_baseline: Option<MeteringBaseline>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UsageReconciliation {
+    pub local_credits_delta: f64,
+    pub local_request_count_delta: u64,
+    pub source_usage_delta: f64,
+    pub unattributed_delta: f64,
+    pub baseline_at: String,
 }
 
 // ============================================================================
@@ -474,6 +504,9 @@ pub struct CredentialEntrySnapshot {
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
+    pub metered_credits: f64,
+    pub metered_request_count: u64,
+    pub metering_started_at: Option<String>,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
     /// 代理 URL（用于前端展示）
@@ -538,6 +571,14 @@ const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 /// 会话账号粘性的内存 TTL。只用于进程内路由，不持久化。
 const STICKY_SESSION_TTL: StdDuration = StdDuration::from_secs(30 * 60);
+
+fn reset_timestamp_changed(previous: Option<f64>, current: Option<f64>) -> bool {
+    match (previous, current) {
+        (Some(previous), Some(current)) => (previous - current).abs() > 1.0,
+        (None, None) => false,
+        _ => true,
+    }
+}
 
 #[derive(Clone)]
 struct StickySessionEntry {
@@ -611,6 +652,10 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     last_used_at: None,
+                    metered_credits: 0.0,
+                    metered_request_count: 0,
+                    metering_started_at: None,
+                    metering_baseline: None,
                 }
             })
             .collect();
@@ -1324,6 +1369,10 @@ impl MultiTokenManager {
             if let Some(s) = stats.get(&entry.id.to_string()) {
                 entry.success_count = s.success_count;
                 entry.last_used_at = s.last_used_at.clone();
+                entry.metered_credits = s.metered_credits;
+                entry.metered_request_count = s.metered_request_count;
+                entry.metering_started_at = s.metering_started_at.clone();
+                entry.metering_baseline = s.metering_baseline.clone();
             }
         }
         *self.last_stats_save_at.lock() = Some(Instant::now());
@@ -1348,6 +1397,10 @@ impl MultiTokenManager {
                         StatsEntry {
                             success_count: e.success_count,
                             last_used_at: e.last_used_at.clone(),
+                            metered_credits: e.metered_credits,
+                            metered_request_count: e.metered_request_count,
+                            metering_started_at: e.metering_started_at.clone(),
+                            metering_baseline: e.metering_baseline.clone(),
                         },
                     )
                 })
@@ -1406,6 +1459,64 @@ impl MultiTokenManager {
             }
         }
         self.save_stats_debounced();
+    }
+
+    pub fn report_metering_usage(&self, id: u64, credits: f64) {
+        if !credits.is_finite() || credits < 0.0 {
+            tracing::warn!("忽略凭据 #{} 的非法 metering credits: {}", id, credits);
+            return;
+        }
+        {
+            let mut entries = self.entries.lock();
+            let Some(entry) = entries.iter_mut().find(|e| e.id == id) else { return };
+            entry.metered_credits += credits;
+            entry.metered_request_count += 1;
+            if entry.metering_started_at.is_none() {
+                entry.metering_started_at = Some(Utc::now().to_rfc3339());
+            }
+            tracing::debug!("凭据 #{} 本次消耗 {:.6} credits（本地累计 {:.6}）", id, credits, entry.metered_credits);
+        }
+        self.save_stats_debounced();
+    }
+
+    pub fn reconcile_usage(
+        &self,
+        id: u64,
+        source_usage: f64,
+        next_reset_at: Option<f64>,
+    ) -> Option<UsageReconciliation> {
+        if !source_usage.is_finite() || source_usage < 0.0 { return None }
+        let mut baseline_changed = false;
+        let result = {
+            let mut entries = self.entries.lock();
+            let entry = entries.iter_mut().find(|e| e.id == id)?;
+            let cycle_changed = entry.metering_baseline.as_ref().map(|baseline| {
+                reset_timestamp_changed(baseline.next_reset_at, next_reset_at)
+                    || source_usage + 1e-9 < baseline.source_usage
+            }).unwrap_or(true);
+            if cycle_changed {
+                entry.metering_baseline = Some(MeteringBaseline {
+                    source_usage,
+                    local_credits: entry.metered_credits,
+                    local_request_count: entry.metered_request_count,
+                    next_reset_at,
+                    created_at: Utc::now().to_rfc3339(),
+                });
+                baseline_changed = true;
+            }
+            let baseline = entry.metering_baseline.as_ref()?;
+            let local_credits_delta = (entry.metered_credits - baseline.local_credits).max(0.0);
+            let source_usage_delta = (source_usage - baseline.source_usage).max(0.0);
+            Some(UsageReconciliation {
+                local_credits_delta,
+                local_request_count_delta: entry.metered_request_count.saturating_sub(baseline.local_request_count),
+                source_usage_delta,
+                unattributed_delta: source_usage_delta - local_credits_delta,
+                baseline_at: baseline.created_at.clone(),
+            })
+        };
+        if baseline_changed { self.save_stats() }
+        result
     }
 
     /// 报告指定凭据 API 调用失败
@@ -1722,6 +1833,9 @@ impl MultiTokenManager {
                     email: e.credentials.email.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
+                    metered_credits: e.metered_credits,
+                    metered_request_count: e.metered_request_count,
+                    metering_started_at: e.metering_started_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
@@ -2042,6 +2156,10 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                metered_credits: 0.0,
+                metered_request_count: 0,
+                metering_started_at: None,
+                metering_baseline: None,
             });
         }
 
@@ -3140,5 +3258,52 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    #[test]
+    fn test_metering_reconciliation_uses_same_cycle_baseline() {
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        let manager = MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+        let initial = manager.reconcile_usage(1, 10.0, Some(1000.0)).unwrap();
+        assert_eq!(initial.local_credits_delta, 0.0);
+        assert_eq!(initial.source_usage_delta, 0.0);
+        manager.report_metering_usage(1, 1.25);
+        let current = manager.reconcile_usage(1, 11.25, Some(1000.0)).unwrap();
+        assert_eq!(current.local_credits_delta, 1.25);
+        assert_eq!(current.local_request_count_delta, 1);
+        assert_eq!(current.source_usage_delta, 1.25);
+        assert_eq!(current.unattributed_delta, 0.0);
+        let next_cycle = manager.reconcile_usage(1, 0.5, Some(2000.0)).unwrap();
+        assert_eq!(next_cycle.local_credits_delta, 0.0);
+        assert_eq!(next_cycle.source_usage_delta, 0.0);
+    }
+
+    #[test]
+    fn test_metering_stats_survive_restart() {
+        let temp = std::env::temp_dir().join(format!("kiro-metering-stats-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let credentials_path = temp.join("credentials.json");
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.machine_id = Some("test-machine".to_string());
+        {
+            let manager = MultiTokenManager::new(
+                Config::default(), vec![credential.clone()], None, Some(credentials_path.clone()), true,
+            ).unwrap();
+            manager.report_metering_usage(1, 2.5);
+            manager.reconcile_usage(1, 7.5, Some(1000.0)).unwrap();
+        }
+        let restored = MultiTokenManager::new(
+            Config::default(), vec![credential], None, Some(credentials_path), true,
+        ).unwrap();
+        let entry = restored.snapshot().entries.remove(0);
+        assert_eq!(entry.metered_credits, 2.5);
+        assert_eq!(entry.metered_request_count, 1);
+        assert!(entry.metering_started_at.is_some());
+        let reconciliation = restored.reconcile_usage(1, 8.0, Some(1000.0)).unwrap();
+        assert_eq!(reconciliation.source_usage_delta, 0.5);
+        assert_eq!(reconciliation.local_credits_delta, 0.0);
+        std::fs::remove_dir_all(temp).unwrap();
     }
 }

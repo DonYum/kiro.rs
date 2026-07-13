@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use super::cache_tracker::{PromptCacheUsage, build_usage_json};
 use crate::kiro::model::events::Event;
+use crate::kiro::provider::MeteringRecorder;
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -549,6 +550,8 @@ pub struct StreamContext {
     strip_thinking_leading_newline: bool,
     /// 模拟缓存使用量（请求带 cache_control 且凭据已确定时设置）
     pub cache_usage: Option<PromptCacheUsage>,
+    /// 本次上游请求的凭据级 credits 记录器。
+    metering_recorder: Option<MeteringRecorder>,
 }
 
 impl StreamContext {
@@ -578,7 +581,12 @@ impl StreamContext {
             text_block_index: None,
             strip_thinking_leading_newline: false,
             cache_usage: None,
+            metering_recorder: None,
         }
+    }
+
+    pub fn set_metering_recorder(&mut self, recorder: MeteringRecorder) {
+        self.metering_recorder = Some(recorder);
     }
 
     /// 生成 message_start 事件
@@ -669,6 +677,18 @@ impl StreamContext {
                     "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
                     context_usage.context_usage_percentage,
                     actual_input_tokens
+                );
+                Vec::new()
+            }
+            Event::Metering(metering) => {
+                if let Some(recorder) = &self.metering_recorder {
+                    recorder.observe(metering.usage);
+                }
+                tracing::debug!(
+                    credits = metering.usage,
+                    input_tokens = metering.input_tokens,
+                    output_tokens = metering.output_tokens,
+                    "收到 Kiro meteringEvent"
                 );
                 Vec::new()
             }
@@ -1163,6 +1183,9 @@ impl StreamContext {
 
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
+        if let Some(recorder) = &self.metering_recorder {
+            recorder.commit();
+        }
         let mut events = Vec::new();
 
         // 如果只有 reasoning 内容（没有后续 text/tool_use），在流结束前关闭 reasoning 块。
@@ -1302,6 +1325,10 @@ impl BufferedStreamContext {
     /// 设置模拟缓存使用量（在凭据确定后调用）
     pub fn set_cache_usage(&mut self, usage: PromptCacheUsage) {
         self.inner.cache_usage = Some(usage);
+    }
+
+    pub fn set_metering_recorder(&mut self, recorder: MeteringRecorder) {
+        self.inner.set_metering_recorder(recorder);
     }
 
     /// 处理 Kiro 事件并缓冲结果

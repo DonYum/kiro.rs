@@ -367,6 +367,7 @@ async fn handle_stream_request(
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    ctx.set_metering_recorder(provider.metering_recorder(result.credential_id));
 
     // 依据实际使用的凭据计算模拟缓存使用量，并登记本次请求的指纹。
     //
@@ -555,6 +556,7 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    let metering_recorder = provider.metering_recorder(result.credential_id);
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -629,6 +631,15 @@ async fn handle_non_stream_request(
                                 actual_input_tokens
                             );
                         }
+                        Event::Metering(metering) => {
+                            metering_recorder.observe(metering.usage);
+                            tracing::debug!(
+                                credits = metering.usage,
+                                input_tokens = metering.input_tokens,
+                                output_tokens = metering.output_tokens,
+                                "收到 Kiro meteringEvent"
+                            );
+                        }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
@@ -643,6 +654,8 @@ async fn handle_non_stream_request(
             }
         }
     }
+
+    metering_recorder.commit();
 
     // 确定 stop_reason
     if has_tool_use && stop_reason == "end_turn" {
@@ -938,6 +951,7 @@ async fn handle_stream_request_buffered(
 
     // 创建缓冲流处理上下文
     let mut ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    ctx.set_metering_recorder(provider.metering_recorder(result.credential_id));
 
     // 依据实际使用的凭据计算模拟缓存使用量并登记指纹。
     // 登记时机与 handle_stream_request 一致（2xx 即登记，tradeoff 见彼处注释）。
