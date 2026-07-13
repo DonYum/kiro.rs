@@ -557,6 +557,8 @@ pub struct MultiTokenManager {
     load_balancing_mode: Mutex<String>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
+    /// 串行化统计文件写入，避免并发 metering 响应互相覆盖。
+    stats_save_lock: Mutex<()>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
     /// balanced 模式下的新会话轮转游标。只影响新选择，不参与统计持久化。
@@ -711,6 +713,7 @@ impl MultiTokenManager {
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
+            stats_save_lock: Mutex::new(()),
             stats_dirty: AtomicBool::new(false),
             balanced_cursor: Mutex::new(0),
             sticky_sessions: Mutex::new(HashMap::new()),
@@ -1382,6 +1385,7 @@ impl MultiTokenManager {
 
     /// 将当前统计数据持久化到磁盘
     fn save_stats(&self) {
+        let _save_guard = self.stats_save_lock.lock();
         let path = match self.stats_path() {
             Some(p) => p,
             None => return,
@@ -1476,7 +1480,8 @@ impl MultiTokenManager {
             }
             tracing::debug!("凭据 #{} 本次消耗 {:.6} credits（本地累计 {:.6}）", id, credits, entry.metered_credits);
         }
-        self.save_stats_debounced();
+        // credits 用于外部用量对账，不能像普通成功次数一样容忍 30 秒丢失窗口。
+        self.save_stats();
     }
 
     pub fn reconcile_usage(
