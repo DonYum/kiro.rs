@@ -781,6 +781,24 @@ impl MultiTokenManager {
             .count()
     }
 
+    pub fn all_available_credentials_excluded(
+        &self,
+        model: Option<&str>,
+        exclude_ids: &[u64],
+    ) -> bool {
+        let entries = self.entries.lock();
+        let mut has_available = false;
+        for entry in entries.iter().filter(|entry| {
+            !entry.disabled && Self::model_supported(&entry.credentials, model)
+        }) {
+            has_available = true;
+            if !exclude_ids.contains(&entry.id) {
+                return false;
+            }
+        }
+        has_available
+    }
+
     pub fn set_credential_rate_limit_cooldown(
         &self,
         credential_id: u64,
@@ -2941,6 +2959,26 @@ mod tests {
 
         assert_ne!(retry.id, first.id);
         assert_eq!(manager.available_count(), 2);
+    }
+
+    #[test]
+    fn test_retry_round_exhaustion_uses_live_available_ids() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                valid_test_credential("token-1", 0),
+                valid_test_credential("token-2", 0),
+                valid_test_credential("token-3", 0),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_disabled(1, true).unwrap();
+
+        assert!(!manager.all_available_credentials_excluded(None, &[1, 2]));
+        assert!(manager.all_available_credentials_excluded(None, &[1, 2, 3]));
     }
 
     #[tokio::test]

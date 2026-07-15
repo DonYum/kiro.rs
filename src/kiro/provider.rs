@@ -186,10 +186,12 @@ impl KiroProvider {
         let mut failed_ids: Vec<u64> = Vec::new();
 
         for attempt in 0..max_retries {
-            Self::start_next_retry_round_if_needed(
-                &mut failed_ids,
-                self.token_manager.available_count_for_model(None),
-            );
+            if self
+                .token_manager
+                .all_available_credentials_excluded(None, &failed_ids)
+            {
+                failed_ids.clear();
+            }
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
             let ctx = match self
                 .token_manager
@@ -384,10 +386,12 @@ impl KiroProvider {
         );
 
         for attempt in 0..max_retries {
-            Self::start_next_retry_round_if_needed(
-                &mut failed_ids,
-                self.token_manager.available_count_for_model(model.as_deref()),
-            );
+            if self
+                .token_manager
+                .all_available_credentials_excluded(model.as_deref(), &failed_ids)
+            {
+                failed_ids.clear();
+            }
             // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self
                 .token_manager
@@ -715,12 +719,6 @@ impl KiroProvider {
         budget.max(floor).min(MAX_TOTAL_RETRIES.max(floor))
     }
 
-    fn start_next_retry_round_if_needed(failed_ids: &mut Vec<u64>, available: usize) {
-        if available > 0 && failed_ids.len() >= available {
-            failed_ids.clear();
-        }
-    }
-
     fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
         let seconds = headers
             .get("retry-after")?
@@ -830,16 +828,6 @@ mod tests {
         assert!(KiroProvider::compute_max_retries(50, 50) >= 50);
         assert!(KiroProvider::compute_max_retries(100, 100) >= 100);
         assert!(KiroProvider::compute_max_retries(20, 7) >= 7);
-    }
-
-    #[test]
-    fn test_retry_round_resets_only_after_full_available_pool() {
-        let mut failed = vec![1, 2, 3];
-        KiroProvider::start_next_retry_round_if_needed(&mut failed, 4);
-        assert_eq!(failed, vec![1, 2, 3]);
-        failed.push(4);
-        KiroProvider::start_next_retry_round_if_needed(&mut failed, 4);
-        assert!(failed.is_empty());
     }
 
     #[test]
