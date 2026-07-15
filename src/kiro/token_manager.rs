@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -102,6 +102,23 @@ impl fmt::Display for RefreshTokenInvalidError {
 }
 
 impl std::error::Error for RefreshTokenInvalidError {}
+
+#[derive(Debug)]
+pub struct AllCredentialsCoolingDownError {
+    pub retry_after_secs: u64,
+}
+
+impl fmt::Display for AllCredentialsCoolingDownError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "所有凭据均处于冷却/速率限制（retry_after_secs={}）",
+            self.retry_after_secs
+        )
+    }
+}
+
+impl std::error::Error for AllCredentialsCoolingDownError {}
 
 /// 刷新 Token
 pub(crate) async fn refresh_token(
@@ -565,6 +582,8 @@ pub struct MultiTokenManager {
     balanced_cursor: Mutex<u64>,
     /// 会话到凭据的进程内粘性映射，key 为 session/conversation ID 的哈希值。
     sticky_sessions: Mutex<HashMap<String, StickySessionEntry>>,
+    /// 上游 429 触发的凭据级短冷却，仅保存在进程内。
+    rate_limit_cooldowns: Mutex<HashMap<u64, Instant>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -573,6 +592,8 @@ const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 /// 会话账号粘性的内存 TTL。只用于进程内路由，不持久化。
 const STICKY_SESSION_TTL: StdDuration = StdDuration::from_secs(30 * 60);
+/// 全凭据冷却超过该阈值时快速返回，由 HTTP 层输出 Retry-After。
+const ALL_CREDENTIALS_COOLDOWN_BAIL_THRESHOLD: StdDuration = StdDuration::from_secs(2);
 
 fn reset_timestamp_changed(previous: Option<f64>, current: Option<f64>) -> bool {
     match (previous, current) {
@@ -717,6 +738,7 @@ impl MultiTokenManager {
             stats_dirty: AtomicBool::new(false),
             balanced_cursor: Mutex::new(0),
             sticky_sessions: Mutex::new(HashMap::new()),
+            rate_limit_cooldowns: Mutex::new(HashMap::new()),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -749,6 +771,83 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
+    pub fn available_count_for_model(&self, model: Option<&str>) -> usize {
+        self.entries
+            .lock()
+            .iter()
+            .filter(|entry| {
+                !entry.disabled && Self::model_supported(&entry.credentials, model)
+            })
+            .count()
+    }
+
+    pub fn set_credential_rate_limit_cooldown(
+        &self,
+        credential_id: u64,
+        duration: StdDuration,
+    ) -> StdDuration {
+        let now = Instant::now();
+        let requested_until = now + duration;
+        let mut cooldowns = self.rate_limit_cooldowns.lock();
+        let effective_until = cooldowns
+            .get(&credential_id)
+            .copied()
+            .map(|current| current.max(requested_until))
+            .unwrap_or(requested_until);
+        cooldowns.insert(credential_id, effective_until);
+        effective_until.saturating_duration_since(now)
+    }
+
+    fn active_rate_limit_cooldown_ids(&self, now: Instant) -> HashSet<u64> {
+        let mut cooldowns = self.rate_limit_cooldowns.lock();
+        cooldowns.retain(|_, until| *until > now);
+        cooldowns.keys().copied().collect()
+    }
+
+    fn rate_limit_cooldown_remaining(
+        &self,
+        credential_id: u64,
+        now: Instant,
+    ) -> Option<StdDuration> {
+        let mut cooldowns = self.rate_limit_cooldowns.lock();
+        cooldowns.retain(|_, until| *until > now);
+        cooldowns
+            .get(&credential_id)
+            .map(|until| until.saturating_duration_since(now))
+    }
+
+    fn all_eligible_credentials_cooling(
+        &self,
+        model: Option<&str>,
+        exclude_ids: &[u64],
+    ) -> Option<StdDuration> {
+        let eligible_ids: Vec<u64> = self
+            .entries
+            .lock()
+            .iter()
+            .filter(|entry| {
+                !entry.disabled
+                    && !exclude_ids.contains(&entry.id)
+                    && Self::model_supported(&entry.credentials, model)
+            })
+            .map(|entry| entry.id)
+            .collect();
+        if eligible_ids.is_empty() {
+            return None;
+        }
+
+        let now = Instant::now();
+        let mut cooldowns = self.rate_limit_cooldowns.lock();
+        cooldowns.retain(|_, until| *until > now);
+        let mut min_wait: Option<StdDuration> = None;
+        for id in eligible_ids {
+            let until = cooldowns.get(&id)?;
+            let wait = until.saturating_duration_since(now);
+            min_wait = Some(min_wait.map_or(wait, |current| current.min(wait)));
+        }
+        min_wait
+    }
+
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
@@ -761,6 +860,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         exclude_ids: &[u64],
     ) -> Option<(u64, KiroCredentials)> {
+        let cooling_ids = self.active_rate_limit_cooldown_ids(Instant::now());
         let entries = self.entries.lock();
 
         // 检查是否是 opus 模型
@@ -776,6 +876,9 @@ impl MultiTokenManager {
                     return false;
                 }
                 if exclude_ids.contains(&e.id) {
+                    return false;
+                }
+                if cooling_ids.contains(&e.id) {
                     return false;
                 }
                 // 如果是 opus 模型，需要检查订阅等级
@@ -912,6 +1015,17 @@ impl MultiTokenManager {
                 credential_id = entry.credential_id,
                 selection_reason = "sticky_skipped_retry_excluded",
                 "Kiro sticky session skipped for this retry because credential already failed in request"
+            );
+            return None;
+        }
+
+        if let Some(remaining) = self.rate_limit_cooldown_remaining(entry.credential_id, now) {
+            tracing::info!(
+                session_hash = %Self::sticky_key_short(&sticky_key),
+                credential_id = entry.credential_id,
+                remaining_ms = remaining.as_millis() as u64,
+                selection_reason = "sticky_skipped_rate_limit_cooldown",
+                "Kiro sticky session skipped while credential is cooling down"
             );
             return None;
         }
@@ -1053,6 +1167,19 @@ impl MultiTokenManager {
         let mut attempt_count = 0;
 
         loop {
+            if let Some(wait) = self.all_eligible_credentials_cooling(model, exclude_ids) {
+                if wait > ALL_CREDENTIALS_COOLDOWN_BAIL_THRESHOLD {
+                    let retry_after_secs =
+                        (wait.as_millis().div_ceil(1000) as u64).max(1);
+                    return Err(AllCredentialsCoolingDownError {
+                        retry_after_secs,
+                    }
+                    .into());
+                }
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+
             if attempt_count >= max_attempts {
                 anyhow::bail!(
                     "所有凭据均无法获取有效 Token（可用: {}/{}）",
@@ -1077,15 +1204,28 @@ impl MultiTokenManager {
                     let current_hit = if is_balanced {
                         None
                     } else {
+                        let cooling_ids = self.active_rate_limit_cooldown_ids(now);
                         let entries = self.entries.lock();
                         let current_id = *self.current_id.lock();
+                        let min_ready_priority = entries
+                            .iter()
+                            .filter(|e| {
+                                !e.disabled
+                                    && !exclude_ids.contains(&e.id)
+                                    && !cooling_ids.contains(&e.id)
+                                    && Self::model_supported(&e.credentials, model)
+                            })
+                            .map(|e| e.credentials.priority)
+                            .min();
                         entries
                             .iter()
                             .find(|e| {
                                 e.id == current_id
                                     && !e.disabled
                                     && !exclude_ids.contains(&e.id)
+                                    && !cooling_ids.contains(&e.id)
                                     && Self::model_supported(&e.credentials, model)
+                                    && Some(e.credentials.priority) == min_ready_priority
                             })
                             .map(|e| (e.id, e.credentials.clone()))
                     };
@@ -2769,6 +2909,109 @@ mod tests {
 
         assert_eq!(retry.id, 2);
         assert_eq!(manager.available_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_cooldown_skips_sticky_credential() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                valid_test_credential("token-1", 0),
+                valid_test_credential("token-2", 0),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let first = manager
+            .acquire_context_for_session(None, Some("session-a"))
+            .await
+            .unwrap();
+        manager.set_credential_rate_limit_cooldown(first.id, StdDuration::from_secs(10));
+
+        let retry = manager
+            .acquire_context_for_session(None, Some("session-a"))
+            .await
+            .unwrap();
+
+        assert_ne!(retry.id, first.id);
+        assert_eq!(manager.available_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_all_credentials_long_cooldown_fails_fast_with_retry_after() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                valid_test_credential("token-1", 0),
+                valid_test_credential("token-2", 0),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_credential_rate_limit_cooldown(1, StdDuration::from_secs(10));
+        manager.set_credential_rate_limit_cooldown(2, StdDuration::from_secs(10));
+
+        let started = Instant::now();
+        let err = match manager.acquire_context(None).await {
+            Ok(_) => panic!("全凭据长冷却时不应获得调用上下文"),
+            Err(err) => err,
+        };
+        let cooling = err
+            .downcast_ref::<AllCredentialsCoolingDownError>()
+            .expect("应返回类型化的全凭据冷却错误");
+
+        assert!(started.elapsed() < StdDuration::from_secs(1));
+        assert!((9..=10).contains(&cooling.retry_after_secs));
+    }
+
+    #[tokio::test]
+    async fn test_all_credentials_short_cooldown_waits_then_recovers() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![valid_test_credential("token-1", 0)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_credential_rate_limit_cooldown(1, StdDuration::from_millis(80));
+
+        let started = Instant::now();
+        let ctx = manager.acquire_context(None).await.unwrap();
+
+        assert_eq!(ctx.id, 1);
+        assert!(started.elapsed() >= StdDuration::from_millis(60));
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_returns_to_high_priority_after_cooldown() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                valid_test_credential("high-priority", 0),
+                valid_test_credential("fallback", 1),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_credential_rate_limit_cooldown(1, StdDuration::from_millis(80));
+
+        let fallback = manager.acquire_context(None).await.unwrap();
+        assert_eq!(fallback.id, 2);
+
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        let recovered = manager.acquire_context(None).await.unwrap();
+        assert_eq!(recovered.id, 1);
     }
 
     #[tokio::test]

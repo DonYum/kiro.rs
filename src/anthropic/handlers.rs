@@ -6,6 +6,7 @@ use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::kiro::token_manager::AllCredentialsCoolingDownError;
 use crate::token;
 use axum::{
     Json as JsonExtractor,
@@ -30,6 +31,27 @@ use super::websearch;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
+    if let Some(cooling) = err.downcast_ref::<AllCredentialsCoolingDownError>() {
+        let retry_after = cooling.retry_after_secs.max(1);
+        tracing::warn!(
+            error = %err,
+            retry_after_secs = retry_after,
+            "所有凭据临时冷却，返回 429 + Retry-After"
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after.to_string())],
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                format!(
+                    "All credentials are temporarily cooling down. Retry after {}s.",
+                    retry_after
+                ),
+            )),
+        )
+            .into_response();
+    }
+
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
@@ -1063,4 +1085,25 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_all_credentials_cooling_error_to_429_with_retry_after() {
+        let response = map_provider_error(
+            AllCredentialsCoolingDownError {
+                retry_after_secs: 9,
+            }
+            .into(),
+        );
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER).unwrap(),
+            "9"
+        );
+    }
 }

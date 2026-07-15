@@ -6,6 +6,7 @@
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
 use reqwest::Client;
+use reqwest::header::HeaderMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +16,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{AllCredentialsCoolingDownError, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,8 +24,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
-/// 总重试次数硬上限（避免无限重试）
-const MAX_TOTAL_RETRIES: usize = 9;
+/// 常规重试预算上限；可用凭据更多时仍保证至少完整遍历一轮。
+const MAX_TOTAL_RETRIES: usize = 64;
+
+const DEFAULT_RATE_LIMIT_COOLDOWN_SECS: u64 = 60;
+const MAX_RATE_LIMIT_COOLDOWN_SECS: u64 = 300;
 
 /// API 调用结果：响应 + 实际使用的凭据 ID
 ///
@@ -173,14 +177,29 @@ impl KiroProvider {
     /// 内部方法：带重试逻辑的 MCP API 调用
     async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let max_retries = Self::compute_max_retries(
+            total_credentials,
+            self.token_manager.available_count_for_model(None),
+        );
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut failed_ids: Vec<u64> = Vec::new();
 
         for attempt in 0..max_retries {
+            Self::start_next_retry_round_if_needed(
+                &mut failed_ids,
+                self.token_manager.available_count_for_model(None),
+            );
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context_for_session_excluding(None, None, &failed_ids)
+                .await
+            {
                 Ok(c) => c,
+                Err(e) if e.downcast_ref::<AllCredentialsCoolingDownError>().is_some() => {
+                    return Err(e);
+                }
                 Err(e) => {
                     last_error = Some(e);
                     continue;
@@ -236,6 +255,7 @@ impl KiroProvider {
             };
 
             let status = response.status();
+            let retry_after = Self::parse_retry_after(response.headers());
 
             // 成功响应
             if status.is_success() {
@@ -282,8 +302,31 @@ impl KiroProvider {
                 continue;
             }
 
+            if status.as_u16() == 429 {
+                if let Some(cooldown) = Self::classify_429_cooldown(&body, retry_after) {
+                    let applied = self
+                        .token_manager
+                        .set_credential_rate_limit_cooldown(ctx.id, cooldown);
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        cooldown_secs = applied.as_secs(),
+                        "MCP 请求触发 429，已设置短冷却并切换凭据"
+                    );
+                } else {
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        "MCP 请求触发容量不足类 429，不冷却凭据，仅切换"
+                    );
+                }
+                if !failed_ids.contains(&ctx.id) {
+                    failed_ids.push(ctx.id);
+                }
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                continue;
+            }
+
             // 瞬态错误
-            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+            if status.as_u16() == 408 || status.is_server_error() {
                 tracing::warn!(
                     "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -319,15 +362,14 @@ impl KiroProvider {
     ///
     /// 重试策略：
     /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
-    /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
-    /// - 硬上限 9 次，避免无限重试
+    /// - 常规预算为 `凭据数量 × 每凭据重试次数`
+    /// - 至少完整遍历当前可用凭据一轮
     async fn call_api_with_retry(
         &self,
         request_body: &str,
         is_stream: bool,
     ) -> anyhow::Result<ApiCallResult> {
         let total_credentials = self.token_manager.total_count();
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut failed_ids: Vec<u64> = Vec::new();
@@ -336,8 +378,16 @@ impl KiroProvider {
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
         let session_id = Self::extract_session_id_from_request(request_body);
+        let max_retries = Self::compute_max_retries(
+            total_credentials,
+            self.token_manager.available_count_for_model(model.as_deref()),
+        );
 
         for attempt in 0..max_retries {
+            Self::start_next_retry_round_if_needed(
+                &mut failed_ids,
+                self.token_manager.available_count_for_model(model.as_deref()),
+            );
             // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self
                 .token_manager
@@ -349,6 +399,9 @@ impl KiroProvider {
                 .await
             {
                 Ok(c) => c,
+                Err(e) if e.downcast_ref::<AllCredentialsCoolingDownError>().is_some() => {
+                    return Err(e);
+                }
                 Err(e) => {
                     last_error = Some(e);
                     continue;
@@ -405,6 +458,7 @@ impl KiroProvider {
             };
 
             let status = response.status();
+            let retry_after = Self::parse_retry_after(response.headers());
 
             // 成功响应
             if status.is_success() {
@@ -525,9 +579,38 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
-            // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
-            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+            if status.as_u16() == 429 {
+                if let Some(cooldown) = Self::classify_429_cooldown(&body, retry_after) {
+                    let applied = self
+                        .token_manager
+                        .set_credential_rate_limit_cooldown(ctx.id, cooldown);
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        cooldown_secs = applied.as_secs(),
+                        "{} API 请求触发 429，已设置短冷却并切换凭据",
+                        api_type
+                    );
+                } else {
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        "{} API 请求触发容量不足类 429，不冷却凭据，仅切换",
+                        api_type
+                    );
+                }
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                if !failed_ids.contains(&ctx.id) {
+                    failed_ids.push(ctx.id);
+                }
+                continue;
+            }
+
+            // 408/5xx - 瞬态上游错误：本轮切换凭据，但不禁用
+            if status.as_u16() == 408 || status.is_server_error() {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -626,6 +709,69 @@ impl KiroProvider {
         lower.contains("invalid_model_id") || lower.contains("invalid model")
     }
 
+    fn compute_max_retries(total_credentials: usize, available: usize) -> usize {
+        let budget = total_credentials.saturating_mul(MAX_RETRIES_PER_CREDENTIAL);
+        let floor = available.max(1);
+        budget.max(floor).min(MAX_TOTAL_RETRIES.max(floor))
+    }
+
+    fn start_next_retry_round_if_needed(failed_ids: &mut Vec<u64>, available: usize) {
+        if available > 0 && failed_ids.len() >= available {
+            failed_ids.clear();
+        }
+    }
+
+    fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+        let seconds = headers
+            .get("retry-after")?
+            .to_str()
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        Some(Self::clamp_rate_limit_cooldown(Duration::from_secs(
+            seconds,
+        )))
+    }
+
+    fn clamp_rate_limit_cooldown(duration: Duration) -> Duration {
+        duration.clamp(
+            Duration::from_secs(DEFAULT_RATE_LIMIT_COOLDOWN_SECS),
+            Duration::from_secs(MAX_RATE_LIMIT_COOLDOWN_SECS),
+        )
+    }
+
+    fn classify_429_cooldown(body: &str, retry_after: Option<Duration>) -> Option<Duration> {
+        if Self::is_insufficient_model_capacity(body) {
+            return None;
+        }
+        Some(Self::clamp_rate_limit_cooldown(retry_after.unwrap_or(
+            Duration::from_secs(DEFAULT_RATE_LIMIT_COOLDOWN_SECS),
+        )))
+    }
+
+    fn is_insufficient_model_capacity(body: &str) -> bool {
+        let matches = |value: &str| {
+            value
+                .to_ascii_uppercase()
+                .contains("INSUFFICIENT_MODEL_CAPACITY")
+        };
+        if matches(body) {
+            return true;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            return false;
+        };
+        value
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .is_some_and(matches)
+            || value
+                .pointer("/error/reason")
+                .and_then(|value| value.as_str())
+                .is_some_and(matches)
+    }
+
     fn retry_delay(attempt: usize) -> Duration {
         // 指数退避 + 少量抖动，避免上游抖动时放大故障
         const BASE_MS: u64 = 200;
@@ -675,6 +821,54 @@ mod tests {
         assert!(!KiroProvider::is_invalid_model_id(
             r#"{"message":"Improperly formed request","reason":"BAD_REQUEST"}"#
         ));
+    }
+
+    #[test]
+    fn test_compute_max_retries_covers_every_available_credential() {
+        assert_eq!(KiroProvider::compute_max_retries(1, 1), 3);
+        assert!(KiroProvider::compute_max_retries(10, 10) >= 10);
+        assert!(KiroProvider::compute_max_retries(50, 50) >= 50);
+        assert!(KiroProvider::compute_max_retries(100, 100) >= 100);
+        assert!(KiroProvider::compute_max_retries(20, 7) >= 7);
+    }
+
+    #[test]
+    fn test_retry_round_resets_only_after_full_available_pool() {
+        let mut failed = vec![1, 2, 3];
+        KiroProvider::start_next_retry_round_if_needed(&mut failed, 4);
+        assert_eq!(failed, vec![1, 2, 3]);
+        failed.push(4);
+        KiroProvider::start_next_retry_round_if_needed(&mut failed, 4);
+        assert!(failed.is_empty());
+    }
+
+    #[test]
+    fn test_classify_429_cooldown_and_capacity_exception() {
+        assert_eq!(
+            KiroProvider::classify_429_cooldown(
+                r#"{"reason":"RATE_LIMIT_EXCEEDED"}"#,
+                None,
+            ),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            KiroProvider::classify_429_cooldown(
+                r#"{"message":"temporary limits due to suspicious activity","reason":null}"#,
+                Some(Duration::from_secs(90)),
+            ),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(
+            KiroProvider::classify_429_cooldown(
+                r#"{"reason":"INSUFFICIENT_MODEL_CAPACITY"}"#,
+                Some(Duration::from_secs(90)),
+            ),
+            None
+        );
+        assert_eq!(
+            KiroProvider::classify_429_cooldown("rate limited", Some(Duration::from_secs(999))),
+            Some(Duration::from_secs(300))
+        );
     }
 
     #[test]
