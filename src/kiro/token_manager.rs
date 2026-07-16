@@ -13,6 +13,7 @@ use tokio::sync::Mutex as TokioMutex;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -572,8 +573,6 @@ pub struct MultiTokenManager {
     is_multiple_format: bool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
-    /// 最近一次统计持久化时间（用于 debounce）
-    last_stats_save_at: Mutex<Option<Instant>>,
     /// 串行化统计文件写入，避免并发 metering 响应互相覆盖。
     stats_save_lock: Mutex<()>,
     /// 统计数据是否有未落盘更新
@@ -588,8 +587,8 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
-/// 统计数据持久化防抖间隔
-const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+/// 统计数据批量持久化间隔。硬崩时最多损失一个间隔内的统计。
+const STATS_FLUSH_INTERVAL: StdDuration = StdDuration::from_secs(5);
 /// 会话账号粘性的内存 TTL。只用于进程内路由，不持久化。
 const STICKY_SESSION_TTL: StdDuration = StdDuration::from_secs(30 * 60);
 /// 全凭据冷却超过该阈值时快速返回，由 HTTP 层输出 Retry-After。
@@ -733,7 +732,6 @@ impl MultiTokenManager {
             credentials_path,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
-            last_stats_save_at: Mutex::new(None),
             stats_save_lock: Mutex::new(()),
             stats_dirty: AtomicBool::new(false),
             balanced_cursor: Mutex::new(0),
@@ -1536,9 +1534,25 @@ impl MultiTokenManager {
                 entry.metering_baseline = s.metering_baseline.clone();
             }
         }
-        *self.last_stats_save_at.lock() = Some(Instant::now());
         self.stats_dirty.store(false, Ordering::Relaxed);
         tracing::info!("已从缓存加载 {} 条统计数据", stats.len());
+    }
+
+    /// 启动单一后台 writer，合并高频统计更新并按固定间隔落盘。
+    pub fn start_stats_writer(self: &Arc<Self>) {
+        let manager = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(STATS_FLUSH_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let Some(manager) = manager.upgrade() else {
+                    break;
+                };
+                manager.flush_stats();
+            }
+        });
     }
 
     /// 将当前统计数据持久化到磁盘
@@ -1548,6 +1562,9 @@ impl MultiTokenManager {
             Some(p) => p,
             None => return,
         };
+
+        // 先清标记再取快照；保存期间的新更新会重新置脏，不会被本次写入吞掉。
+        self.stats_dirty.store(false, Ordering::Release);
 
         let stats: HashMap<String, StatsEntry> = {
             let entries = self.entries.lock();
@@ -1571,30 +1588,28 @@ impl MultiTokenManager {
 
         match serde_json::to_string_pretty(&stats) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
+                let temporary_path = path.with_extension("json.tmp");
+                let result = std::fs::write(&temporary_path, json)
+                    .and_then(|_| std::fs::rename(&temporary_path, &path));
+                if let Err(e) = result {
+                    self.stats_dirty.store(true, Ordering::Release);
                     tracing::warn!("保存统计缓存失败: {}", e);
-                } else {
-                    *self.last_stats_save_at.lock() = Some(Instant::now());
-                    self.stats_dirty.store(false, Ordering::Relaxed);
                 }
             }
-            Err(e) => tracing::warn!("序列化统计数据失败: {}", e),
+            Err(e) => {
+                self.stats_dirty.store(true, Ordering::Release);
+                tracing::warn!("序列化统计数据失败: {}", e);
+            }
         }
     }
 
-    /// 标记统计数据已更新，并按 debounce 策略决定是否立即落盘
-    fn save_stats_debounced(&self) {
-        self.stats_dirty.store(true, Ordering::Relaxed);
+    fn mark_stats_dirty(&self) {
+        self.stats_dirty.store(true, Ordering::Release);
+    }
 
-        let should_flush = {
-            let last = *self.last_stats_save_at.lock();
-            match last {
-                Some(last_saved_at) => last_saved_at.elapsed() >= STATS_SAVE_DEBOUNCE,
-                None => true,
-            }
-        };
-
-        if should_flush {
+    /// 立即落盘所有待保存统计，用于后台周期和优雅停机。
+    pub fn flush_stats(&self) {
+        if self.stats_dirty.load(Ordering::Acquire) {
             self.save_stats();
         }
     }
@@ -1620,7 +1635,7 @@ impl MultiTokenManager {
                 );
             }
         }
-        self.save_stats_debounced();
+        self.mark_stats_dirty();
     }
 
     pub fn report_metering_usage(&self, id: u64, credits: f64) {
@@ -1638,8 +1653,7 @@ impl MultiTokenManager {
             }
             tracing::debug!("凭据 #{} 本次消耗 {:.6} credits（本地累计 {:.6}）", id, credits, entry.metered_credits);
         }
-        // credits 用于外部用量对账，不能像普通成功次数一样容忍 30 秒丢失窗口。
-        self.save_stats();
+        self.mark_stats_dirty();
     }
 
     pub fn reconcile_usage(
@@ -1743,7 +1757,7 @@ impl MultiTokenManager {
         if should_unbind {
             self.remove_sticky_sessions_for_credential(id);
         }
-        self.save_stats_debounced();
+        self.mark_stats_dirty();
         result
     }
 
@@ -1796,7 +1810,7 @@ impl MultiTokenManager {
         if should_unbind {
             self.remove_sticky_sessions_for_credential(id);
         }
-        self.save_stats_debounced();
+        self.mark_stats_dirty();
         result
     }
 
@@ -1862,7 +1876,7 @@ impl MultiTokenManager {
         if should_unbind {
             self.remove_sticky_sessions_for_credential(id);
         }
-        self.save_stats_debounced();
+        self.mark_stats_dirty();
         result
     }
 
@@ -1913,7 +1927,7 @@ impl MultiTokenManager {
         if should_unbind {
             self.remove_sticky_sessions_for_credential(id);
         }
-        self.save_stats_debounced();
+        self.mark_stats_dirty();
         result
     }
 
@@ -3590,6 +3604,56 @@ mod tests {
         let reconciliation = restored.reconcile_usage(1, 8.0, Some(1000.0)).unwrap();
         assert_eq!(reconciliation.source_usage_delta, 0.5);
         assert_eq!(reconciliation.local_credits_delta, 0.0);
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_metering_stats_flush_every_five_seconds_and_on_shutdown() {
+        let temp = std::env::temp_dir().join(format!(
+            "kiro-metering-batched-stats-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let credentials_path = temp.join("credentials.json");
+        let stats_path = temp.join("kiro_stats.json");
+        let temporary_stats_path = temp.join("kiro_stats.json.tmp");
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.machine_id = Some("test-machine".to_string());
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![credential],
+                None,
+                Some(credentials_path),
+                true,
+            )
+            .unwrap(),
+        );
+        manager.start_stats_writer();
+
+        for _ in 0..100 {
+            manager.report_metering_usage(1, 0.5);
+        }
+        assert!(!stats_path.exists(), "逐请求不应立即重写统计文件");
+
+        tokio::time::sleep(STATS_FLUSH_INTERVAL + StdDuration::from_millis(250)).await;
+        let persisted: HashMap<String, StatsEntry> =
+            serde_json::from_str(&std::fs::read_to_string(&stats_path).unwrap()).unwrap();
+        assert_eq!(persisted["1"].metered_credits, 50.0);
+        assert_eq!(persisted["1"].metered_request_count, 100);
+        assert!(!temporary_stats_path.exists(), "原子替换后不应残留临时文件");
+
+        manager.report_metering_usage(1, 1.0);
+        let before_shutdown: HashMap<String, StatsEntry> =
+            serde_json::from_str(&std::fs::read_to_string(&stats_path).unwrap()).unwrap();
+        assert_eq!(before_shutdown["1"].metered_credits, 50.0);
+        manager.flush_stats();
+        let after_shutdown: HashMap<String, StatsEntry> =
+            serde_json::from_str(&std::fs::read_to_string(&stats_path).unwrap()).unwrap();
+        assert_eq!(after_shutdown["1"].metered_credits, 51.0);
+
+        drop(manager);
         std::fs::remove_dir_all(temp).unwrap();
     }
 }

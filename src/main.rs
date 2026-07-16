@@ -141,6 +141,7 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+    token_manager.start_stats_writer();
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
@@ -215,5 +216,35 @@ async fn main() {
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(token_manager.clone()))
+        .await
+        .unwrap();
+    token_manager.flush_stats();
+}
+
+async fn shutdown_signal(token_manager: Arc<MultiTokenManager>) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    token_manager.flush_stats();
+    tracing::info!("收到退出信号，正在完成请求并保存统计");
 }
