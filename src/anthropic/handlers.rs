@@ -1188,6 +1188,15 @@ fn create_buffered_sse_stream(
 mod tests {
     use super::*;
 
+    fn messages_request(model: &str) -> MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": model,
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn map_all_credentials_cooling_error_to_429_with_retry_after() {
         let response = map_provider_error(
@@ -1202,5 +1211,35 @@ mod tests {
             response.headers().get(header::RETRY_AFTER).unwrap(),
             "9"
         );
+    }
+
+    #[test]
+    fn opus_5_thinking_uses_adaptive_high_effort() {
+        let mut payload = messages_request("claude-opus-5-thinking");
+
+        override_thinking_from_model_name(&mut payload);
+
+        let thinking = payload.thinking.unwrap();
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.budget_tokens, 20_000);
+        assert_eq!(payload.output_config.unwrap().effort, "high");
+    }
+
+    #[tokio::test]
+    async fn models_list_includes_opus_5_variants() {
+        let response = get_models().await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+
+        assert!(ids.contains(&"claude-opus-5"));
+        assert!(ids.contains(&"claude-opus-5-thinking"));
     }
 }
