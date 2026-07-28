@@ -2,6 +2,7 @@ mod admin;
 mod admin_ui;
 mod anthropic;
 mod common;
+mod capture;
 mod http_client;
 mod kiro;
 mod model;

@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::capture::CaptureSession;
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, MessagesRequest};
 
@@ -525,15 +526,42 @@ async fn call_mcp_api(
     request: &McpRequest,
 ) -> anyhow::Result<McpResponse> {
     let request_body = serde_json::to_string(request)?;
+    let mut capture = CaptureSession::new(&request_body, "kiro-web-search", false);
 
     tracing::debug!("MCP request: {}", request_body);
 
-    let response = provider.call_mcp(&request_body).await?;
+    let response = match provider.call_mcp(&request_body).await {
+        Ok(response) => response,
+        Err(error) => {
+            capture
+                .finish("provider_error", Some(error.to_string()))
+                .await;
+            return Err(error);
+        }
+    };
 
-    let body = response.text().await?;
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(error) => {
+            capture.finish("body_error", Some(error.to_string())).await;
+            return Err(error.into());
+        }
+    };
+    capture.record_payload(
+        Some("response".to_string()),
+        Some("mcp_response".to_string()),
+        &body,
+    );
     tracing::debug!("MCP response: {}", body);
 
-    let mcp_response: McpResponse = serde_json::from_str(&body)?;
+    let mcp_response: McpResponse = match serde_json::from_str(&body) {
+        Ok(response) => response,
+        Err(error) => {
+            capture.finish("parse_error", Some(error.to_string())).await;
+            return Err(error.into());
+        }
+    };
+    capture.finish("complete", None).await;
 
     if let Some(ref error) = mcp_response.error {
         anyhow::bail!(
