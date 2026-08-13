@@ -453,6 +453,8 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
+    /// 账户被上游临时暂停
+    AccountSuspended,
 }
 
 /// 统计数据持久化条目
@@ -1607,6 +1609,25 @@ impl MultiTokenManager {
         self.stats_dirty.store(true, Ordering::Release);
     }
 
+    fn report_account_suspended(&self, id: u64) {
+        let mut disabled = false;
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::AccountSuspended);
+                entry.last_used_at = Some(Utc::now().to_rfc3339());
+                disabled = true;
+            }
+        }
+
+        if disabled {
+            tracing::warn!("凭据 #{} 上游返回 TEMPORARILY_SUSPENDED，已立即禁用", id);
+            self.remove_sticky_sessions_for_credential(id);
+            self.mark_stats_dirty();
+        }
+    }
+
     /// 立即落盘所有待保存统计，用于后台周期和优雅停机。
     pub fn flush_stats(&self) {
         if self.stats_dirty.load(Ordering::Acquire) {
@@ -2023,6 +2044,7 @@ impl MultiTokenManager {
                         DisabledReason::QuotaExceeded => "QuotaExceeded",
                         DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                         DisabledReason::InvalidConfig => "InvalidConfig",
+                        DisabledReason::AccountSuspended => "AccountSuspended",
                     }.to_string()),
                     endpoint: e.credentials.endpoint.clone(),
                 })
@@ -2178,7 +2200,15 @@ impl MultiTokenManager {
         };
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let usage_limits = match get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await {
+            Ok(usage_limits) => usage_limits,
+            Err(err) => {
+                if err.to_string().contains("TEMPORARILY_SUSPENDED") {
+                    self.report_account_suspended(id);
+                }
+                return Err(err);
+            }
+        };
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -3364,6 +3394,36 @@ mod tests {
             "错误应提示所有凭据禁用，实际: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_report_account_suspended_disables_and_unbinds_sticky_sessions() {
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.access_token = Some("token-1".to_string());
+        credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![credential],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let now = Instant::now();
+        manager.bind_sticky_session(Some("session-a"), 1, None, now);
+        assert!(manager.lookup_sticky_credential(Some("session-a"), None, &[], now).is_some());
+
+        manager.report_account_suspended(1);
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(entry.disabled);
+        assert_eq!(entry.disabled_reason.as_deref(), Some("AccountSuspended"));
+        assert!(manager.lookup_sticky_credential(Some("session-a"), None, &[], now).is_none());
+        assert_eq!(manager.available_count(), 0);
     }
 
     #[test]
