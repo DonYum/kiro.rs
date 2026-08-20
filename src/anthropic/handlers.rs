@@ -99,6 +99,15 @@ pub async fn get_models() -> impl IntoResponse {
 
     let models = vec![
         Model {
+            id: "kiro-gpt-5.6-luna".to_string(),
+            object: "model".to_string(),
+            created: 1784592000, // Jul 21, 2026
+            owned_by: "kiro".to_string(),
+            display_name: "Kiro GPT 5.6 Luna".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
             id: "claude-opus-5".to_string(),
             object: "model".to_string(),
             created: 1782777600, // Jun 30, 2026
@@ -849,7 +858,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
-    
+
     if is_adaptive_thinking {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
@@ -1241,5 +1250,25 @@ mod tests {
 
         assert!(ids.contains(&"claude-opus-5"));
         assert!(ids.contains(&"claude-opus-5-thinking"));
+    }
+
+    #[tokio::test]
+    async fn models_list_includes_gpt_luna_alias_only() {
+        let response = get_models().await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+
+        assert!(ids.contains(&"kiro-gpt-5.6-luna"));
+        assert!(!ids.contains(&"gpt-5.6-luna"));
+        assert!(!ids.contains(&"glm-5"));
+        assert!(!ids.contains(&"kiro-glm-5"));
     }
 }
