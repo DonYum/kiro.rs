@@ -50,6 +50,20 @@ pub struct PromptCacheUsage {
     pub cache_creation_1h_input_tokens: i32,
 }
 
+/// 只用于最终 usage 合成时的脱敏观测元数据。
+///
+/// 不包含缓存指纹、请求正文、prompt、工具参数或凭据。
+#[derive(Debug, Clone)]
+pub struct CacheUsageObservation {
+    pub model: String,
+    pub context_window: i32,
+    pub request_estimated_input: i32,
+    pub breakpoint_count: usize,
+    pub cache_cap: i32,
+    pub cache_hit: bool,
+    pub cache_miss: bool,
+}
+
 /// 缓存断点：前缀指纹 + 累计 token 数 + TTL
 struct PromptCacheBreakpoint {
     fingerprint: [u8; 32],
@@ -81,6 +95,18 @@ impl PromptCacheProfile {
             breakpoint.cumulative_tokens = breakpoint.cumulative_tokens.min(cap);
         }
     }
+
+    fn usage_observation(&self, usage: &PromptCacheUsage) -> CacheUsageObservation {
+        CacheUsageObservation {
+            model: self.model.clone(),
+            context_window: context_window_for_model(&self.model),
+            request_estimated_input: self.total_input_tokens,
+            breakpoint_count: self.breakpoints.len(),
+            cache_cap: max_reportable_cache_tokens(self.total_input_tokens),
+            cache_hit: usage.cache_read_input_tokens > 0,
+            cache_miss: usage.cache_creation_input_tokens > 0,
+        }
+    }
 }
 
 /// 请求处理链路中携带的缓存上下文
@@ -88,6 +114,12 @@ impl PromptCacheProfile {
 pub struct CacheContext {
     pub tracker: Arc<PromptCacheTracker>,
     pub profile: Arc<PromptCacheProfile>,
+}
+
+impl CacheContext {
+    pub fn usage_observation(&self, usage: &PromptCacheUsage) -> CacheUsageObservation {
+        self.profile.usage_observation(usage)
+    }
 }
 
 struct PromptCacheEntry {
@@ -330,11 +362,50 @@ fn compute_ttl_breakdown(
 /// 计费口径下的 input_tokens：总输入减去缓存创建与缓存读取部分
 pub fn billed_input_tokens(input_tokens: i32, cache: Option<&PromptCacheUsage>) -> i32 {
     match cache {
-        Some(usage) => (input_tokens
-            - usage.cache_creation_input_tokens
-            - usage.cache_read_input_tokens)
-            .max(0),
+        Some(usage) => {
+            (input_tokens - usage.cache_creation_input_tokens - usage.cache_read_input_tokens)
+                .max(0)
+        }
         None => input_tokens,
+    }
+}
+
+/// 将模拟缓存用量约束到上游最终确认的上下文输入量。
+///
+/// cache tracker 必须在流开始前根据请求画像推导 cache hit/miss；但后续
+/// `contextUsageEvent` 可能给出更低的最终输入量。若不在这里反向约束，便会
+/// 产生 `input_tokens=0` 而仍有高额 cache_creation 的不一致账务。
+pub fn constrain_cache_usage_to_final_input(
+    final_input_tokens: i32,
+    usage: PromptCacheUsage,
+) -> PromptCacheUsage {
+    let budget = final_input_tokens.max(0);
+    let original_creation = usage.cache_creation_input_tokens.max(0);
+    let original_read = usage.cache_read_input_tokens.max(0);
+
+    if original_creation.saturating_add(original_read) <= budget {
+        return usage;
+    }
+
+    // 先保留可证明已命中的缓存读取；剩余预算才允许作为本轮缓存创建。
+    let cache_read_input_tokens = original_read.min(budget);
+    let cache_creation_input_tokens = original_creation.min(budget - cache_read_input_tokens);
+
+    // 创建量下降时按原 5m/1h 比例缩放，且保证两个 TTL 明细的和不变。
+    let cache_creation_5m_input_tokens = if original_creation == 0 {
+        0
+    } else {
+        ((usage.cache_creation_5m_input_tokens.max(0) as i64 * cache_creation_input_tokens as i64)
+            / original_creation as i64) as i32
+    };
+    let cache_creation_1h_input_tokens =
+        cache_creation_input_tokens - cache_creation_5m_input_tokens;
+
+    PromptCacheUsage {
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+        cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens,
     }
 }
 
@@ -344,11 +415,55 @@ pub fn build_usage_json(
     output_tokens: i32,
     cache: Option<&PromptCacheUsage>,
 ) -> Value {
+    build_usage_json_with_observation(input_tokens, output_tokens, cache, None, None)
+}
+
+/// 构建 usage JSON，并在最终 context input 下调模拟缓存量时写脱敏观测日志。
+pub fn build_usage_json_with_observation(
+    input_tokens: i32,
+    output_tokens: i32,
+    cache: Option<&PromptCacheUsage>,
+    final_context_input: Option<i32>,
+    observation: Option<&CacheUsageObservation>,
+) -> Value {
+    // 只有上游明确给出 contextUsageEvent 时，才用它反向约束请求侧模拟值。
+    // 事件缺失时保留原有的请求侧估算行为，避免把“未知”误当作 0。
+    let constrained_cache = cache.map(|usage| match final_context_input {
+        Some(final_input_tokens) => {
+            constrain_cache_usage_to_final_input(final_input_tokens, *usage)
+        }
+        None => *usage,
+    });
+    if let (Some(before), Some(after), Some(obs), Some(final_input_tokens)) = (
+        cache,
+        constrained_cache.as_ref(),
+        observation,
+        final_context_input,
+    ) {
+        if before != after {
+            tracing::info!(
+                model = %obs.model,
+                context_window = obs.context_window,
+                request_estimated_input = obs.request_estimated_input,
+                final_context_input = final_input_tokens.max(0),
+                breakpoint_count = obs.breakpoint_count,
+                cache_cap = obs.cache_cap,
+                cache_hit = obs.cache_hit,
+                cache_miss = obs.cache_miss,
+                cache_creation_before = before.cache_creation_input_tokens,
+                cache_read_before = before.cache_read_input_tokens,
+                cache_creation_after = after.cache_creation_input_tokens,
+                cache_read_after = after.cache_read_input_tokens,
+                "constrained simulated cache usage to final context input"
+            );
+        }
+    }
+
     let mut usage = json!({
-        "input_tokens": billed_input_tokens(input_tokens, cache),
+        "input_tokens": billed_input_tokens(input_tokens, constrained_cache.as_ref()),
         "output_tokens": output_tokens,
     });
-    if let Some(c) = cache {
+    if let Some(c) = constrained_cache.as_ref() {
         usage["cache_creation_input_tokens"] = json!(c.cache_creation_input_tokens);
         usage["cache_read_input_tokens"] = json!(c.cache_read_input_tokens);
         usage["cache_creation"] = json!({
@@ -433,7 +548,12 @@ fn flatten_claude_cache_blocks(req: &MessagesRequest) -> Vec<CacheableBlock> {
     blocks
 }
 
-fn push_block(blocks: &mut Vec<CacheableBlock>, value: &Value, ttl: Duration, is_message_end: bool) {
+fn push_block(
+    blocks: &mut Vec<CacheableBlock>,
+    value: &Value,
+    ttl: Duration,
+    is_message_end: bool,
+) {
     let canonical = canonicalize_cache_value(value);
     let tokens = estimate_approx_tokens(&canonical);
     blocks.push(CacheableBlock {
@@ -493,9 +613,11 @@ fn parse_ttl_value(value: &Value) -> Option<Duration> {
             }
             // 支持 "5m"、"1h"、"300s" 及纯数字秒
             if let Some(num) = trimmed.strip_suffix('h') {
-                return num.parse::<f64>().ok().filter(|v| *v > 0.0).map(|v| {
-                    Duration::from_secs_f64(v * 3600.0)
-                });
+                return num
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| *v > 0.0)
+                    .map(|v| Duration::from_secs_f64(v * 3600.0));
             }
             if let Some(num) = trimmed.strip_suffix('m') {
                 return num
@@ -517,10 +639,7 @@ fn parse_ttl_value(value: &Value) -> Option<Duration> {
                 .filter(|v| *v > 0)
                 .map(Duration::from_secs)
         }
-        Value::Number(n) => n
-            .as_f64()
-            .filter(|v| *v > 0.0)
-            .map(Duration::from_secs_f64),
+        Value::Number(n) => n.as_f64().filter(|v| *v > 0.0).map(Duration::from_secs_f64),
         _ => None,
     }
 }
@@ -699,6 +818,89 @@ mod tests {
     }
 
     #[test]
+    fn final_context_input_preserves_normal_large_cache_miss() {
+        let before = PromptCacheUsage {
+            cache_creation_input_tokens: 850_000,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 850_000,
+            cache_creation_1h_input_tokens: 0,
+        };
+
+        let after = constrain_cache_usage_to_final_input(1_000_000, before);
+        assert_eq!(after, before);
+
+        let usage =
+            build_usage_json_with_observation(1_000_000, 1, Some(&before), Some(1_000_000), None);
+        assert_eq!(usage["input_tokens"], 150_000);
+        assert_eq!(usage["cache_creation_input_tokens"], 850_000);
+        assert_eq!(usage["cache_read_input_tokens"], 0);
+    }
+
+    #[test]
+    fn final_context_input_zero_clears_simulated_cache_usage() {
+        let before = PromptCacheUsage {
+            cache_creation_input_tokens: 850_000,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 850_000,
+            cache_creation_1h_input_tokens: 0,
+        };
+
+        let after = constrain_cache_usage_to_final_input(0, before);
+        assert_eq!(after, PromptCacheUsage::default());
+
+        let usage = build_usage_json_with_observation(0, 1, Some(&before), Some(0), None);
+        assert_eq!(usage["input_tokens"], 0);
+        assert_eq!(usage["cache_creation_input_tokens"], 0);
+        assert_eq!(usage["cache_read_input_tokens"], 0);
+        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 0);
+        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 0);
+    }
+
+    #[test]
+    fn final_context_input_limits_combined_cache_usage() {
+        let before = PromptCacheUsage {
+            cache_creation_input_tokens: 600,
+            cache_read_input_tokens: 300,
+            cache_creation_5m_input_tokens: 300,
+            cache_creation_1h_input_tokens: 300,
+        };
+
+        let after = constrain_cache_usage_to_final_input(500, before);
+        // 缓存读取优先保留，剩余预算才分配给本轮创建；TTL 明细仍保持一致。
+        assert_eq!(after.cache_read_input_tokens, 300);
+        assert_eq!(after.cache_creation_input_tokens, 200);
+        assert_eq!(after.cache_creation_5m_input_tokens, 100);
+        assert_eq!(after.cache_creation_1h_input_tokens, 100);
+        assert_eq!(
+            after.cache_creation_input_tokens + after.cache_read_input_tokens,
+            500
+        );
+        assert_eq!(
+            after.cache_creation_5m_input_tokens + after.cache_creation_1h_input_tokens,
+            after.cache_creation_input_tokens
+        );
+    }
+
+    #[test]
+    fn cache_usage_observation_contains_only_sanitized_fields() {
+        let observation = CacheUsageObservation {
+            model: "claude-opus-5".to_string(),
+            context_window: 1_000_000,
+            request_estimated_input: 850_000,
+            breakpoint_count: 2,
+            cache_cap: 850_000,
+            cache_hit: false,
+            cache_miss: true,
+        };
+
+        let rendered = format!("{observation:?}");
+        assert!(!rendered.contains("fingerprint"));
+        assert!(!rendered.contains("prompt"));
+        assert!(!rendered.contains("body"));
+        assert!(!rendered.contains("key"));
+    }
+
+    #[test]
     fn test_stable_across_billing_header_drift() {
         let tracker = PromptCacheTracker::new();
         let build = |billing_header: &str| {
@@ -724,7 +926,8 @@ mod tests {
         assert_eq!(first.cache_read_input_tokens, 0);
         tracker.update(1, &profile1);
 
-        let req2 = build("x-anthropic-billing-header: cc_version=2.1.87.42; cch=bbbb; padding=xxyyzz;");
+        let req2 =
+            build("x-anthropic-billing-header: cc_version=2.1.87.42; cch=bbbb; padding=xxyyzz;");
         let mut profile2 = tracker.build_claude_profile(&req2).unwrap();
         profile2.raise_total_input_tokens(2048);
         let second = tracker.compute(1, &profile2);
@@ -978,8 +1181,14 @@ mod tests {
     #[test]
     fn test_ttl_normalization_and_breakdown() {
         assert_eq!(normalize_ttl(Duration::ZERO), Duration::ZERO);
-        assert_eq!(normalize_ttl(Duration::from_secs(60)), DEFAULT_PROMPT_CACHE_TTL);
-        assert_eq!(normalize_ttl(Duration::from_secs(300)), DEFAULT_PROMPT_CACHE_TTL);
+        assert_eq!(
+            normalize_ttl(Duration::from_secs(60)),
+            DEFAULT_PROMPT_CACHE_TTL
+        );
+        assert_eq!(
+            normalize_ttl(Duration::from_secs(300)),
+            DEFAULT_PROMPT_CACHE_TTL
+        );
         assert_eq!(normalize_ttl(Duration::from_secs(301)), ONE_HOUR);
         assert_eq!(normalize_ttl(Duration::from_secs(7200)), ONE_HOUR);
 
@@ -991,10 +1200,7 @@ mod tests {
             parse_ttl_value(&json!("1h")),
             Some(Duration::from_secs(3600))
         );
-        assert_eq!(
-            parse_ttl_value(&json!(300)),
-            Some(Duration::from_secs(300))
-        );
+        assert_eq!(parse_ttl_value(&json!(300)), Some(Duration::from_secs(300)));
     }
 
     #[test]
