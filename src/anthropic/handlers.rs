@@ -2,13 +2,13 @@
 
 use std::convert::Infallible;
 
-use anyhow::Error;
 use crate::capture::CaptureSession;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::token_manager::AllCredentialsCoolingDownError;
 use crate::token;
+use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
@@ -23,11 +23,14 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::cache_tracker::{CacheContext, PromptCacheUsage, build_usage_json};
+use super::cache_tracker::{CacheContext, build_usage_json_with_observation};
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::types::{
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
+    OutputConfig, Thinking,
+};
 use super::websearch;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -406,7 +409,17 @@ pub async fn post_messages(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, cache_context, capture).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            cache_context,
+            capture,
+        )
+        .await
     }
 }
 
@@ -439,7 +452,8 @@ async fn handle_stream_request(
     }
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx =
+        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
     ctx.set_metering_recorder(provider.metering_recorder(result.credential_id));
 
     // 依据实际使用的凭据计算模拟缓存使用量，并登记本次请求的指纹。
@@ -452,8 +466,10 @@ async fn handle_stream_request(
     // 若要保守计费（宁多算不少算），应把 update 延迟到流成功结束后。
     if let Some(cc) = &cache_context {
         let usage = cc.tracker.compute(result.credential_id, &cc.profile);
+        let observation = cc.usage_observation(&usage);
         cc.tracker.update(result.credential_id, &cc.profile);
         ctx.cache_usage = Some(usage);
+        ctx.cache_usage_observation = Some(observation);
     }
 
     // 生成初始事件
@@ -607,11 +623,14 @@ async fn handle_non_stream_request(
 
     // 依据实际使用的凭据计算模拟缓存使用量并登记指纹。
     // 登记时机与流式路径一致（2xx 即登记，见 handle_stream_request 的 tradeoff 注释）。
-    let cache_usage: Option<PromptCacheUsage> = cache_context.as_ref().map(|cc| {
+    let (cache_usage, cache_observation) = if let Some(cc) = cache_context.as_ref() {
         let usage = cc.tracker.compute(result.credential_id, &cc.profile);
+        let observation = cc.usage_observation(&usage);
         cc.tracker.update(result.credential_id, &cc.profile);
-        usage
-    });
+        (Some(usage), Some(observation))
+    } else {
+        (None, None)
+    };
 
     // 读取响应体
     let body_bytes = match result.response.bytes().await {
@@ -680,14 +699,14 @@ async fn handle_non_stream_request(
                                 let input: serde_json::Value = if buffer.is_empty() {
                                     serde_json::json!({})
                                 } else {
-                                    serde_json::from_str(buffer)
-                                        .unwrap_or_else(|e| {
-                                            tracing::warn!(
-                                                "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                                e, tool_use.tool_use_id
-                                            );
-                                            serde_json::json!({})
-                                        })
+                                    serde_json::from_str(buffer).unwrap_or_else(|e| {
+                                        tracing::warn!(
+                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}",
+                                            e,
+                                            tool_use.tool_use_id
+                                        );
+                                        serde_json::json!({})
+                                    })
                                 };
 
                                 let original_name = tool_name_map
@@ -706,10 +725,9 @@ async fn handle_non_stream_request(
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
                             let window_size = get_context_window_size(model);
-                            let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (window_size as f64)
-                                / 100.0)
-                                as i32;
+                            let actual_input_tokens =
+                                (context_usage.context_usage_percentage * (window_size as f64)
+                                    / 100.0) as i32;
                             context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
@@ -809,7 +827,13 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": build_usage_json(final_input_tokens, output_tokens, cache_usage.as_ref())
+        "usage": build_usage_json_with_observation(
+            final_input_tokens,
+            output_tokens,
+            cache_usage.as_ref(),
+            context_input_tokens,
+            cache_observation.as_ref(),
+        )
     });
 
     capture.finish("complete", None).await;
@@ -849,7 +873,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
-    
+
     if is_adaptive_thinking {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
@@ -1022,7 +1046,17 @@ pub async fn post_messages_cc(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, cache_context, capture).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            cache_context,
+            capture,
+        )
+        .await
     }
 }
 
@@ -1058,15 +1092,21 @@ async fn handle_stream_request_buffered(
     }
 
     // 创建缓冲流处理上下文
-    let mut ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = BufferedStreamContext::new(
+        model,
+        estimated_input_tokens,
+        thinking_enabled,
+        tool_name_map,
+    );
     ctx.set_metering_recorder(provider.metering_recorder(result.credential_id));
 
     // 依据实际使用的凭据计算模拟缓存使用量并登记指纹。
     // 登记时机与 handle_stream_request 一致（2xx 即登记，tradeoff 见彼处注释）。
     if let Some(cc) = &cache_context {
         let usage = cc.tracker.compute(result.credential_id, &cc.profile);
+        let observation = cc.usage_observation(&usage);
         cc.tracker.update(result.credential_id, &cc.profile);
-        ctx.set_cache_usage(usage);
+        ctx.set_cache_usage_with_observation(usage, observation);
     }
 
     // 创建缓冲 SSE 流
@@ -1207,10 +1247,7 @@ mod tests {
         );
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            response.headers().get(header::RETRY_AFTER).unwrap(),
-            "9"
-        );
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "9");
     }
 
     #[test]
