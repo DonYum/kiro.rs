@@ -79,6 +79,18 @@ pub struct PromptCacheProfile {
 }
 
 impl PromptCacheProfile {
+    pub fn breakpoint_count(&self) -> usize {
+        self.breakpoints.len()
+    }
+
+    pub fn eligible_breakpoint_count(&self) -> usize {
+        let min_tokens = min_cacheable_tokens_for_model(&self.model);
+        self.breakpoints
+            .iter()
+            .filter(|b| b.cumulative_tokens >= min_tokens)
+            .count()
+    }
+
     /// 用外部估算的输入 token 数抬高总量（不低于断点累计值），但不超过模型上下文窗口。
     pub fn raise_total_input_tokens(&mut self, estimated: i32) {
         let capped = estimated.max(0).min(context_window_for_model(&self.model));
@@ -120,6 +132,12 @@ impl CacheContext {
     pub fn usage_observation(&self, usage: &PromptCacheUsage) -> CacheUsageObservation {
         self.profile.usage_observation(usage)
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PromptCacheRequestStats {
+    pub cache_control_count: usize,
+    pub image_count: usize,
 }
 
 struct PromptCacheEntry {
@@ -315,6 +333,32 @@ impl PromptCacheTracker {
             );
         }
     }
+}
+
+pub fn inspect_claude_cache_markers(req: &MessagesRequest) -> PromptCacheRequestStats {
+    let mut stats = PromptCacheRequestStats::default();
+
+    if let Some(tools) = &req.tools {
+        for tool in tools {
+            if tool.cache_control.is_some() {
+                stats.cache_control_count += 1;
+            }
+        }
+    }
+
+    if let Some(system) = &req.system {
+        for msg in system {
+            if msg.cache_control.is_some() {
+                stats.cache_control_count += 1;
+            }
+        }
+    }
+
+    for msg in &req.messages {
+        count_value_markers(&msg.content, &mut stats);
+    }
+
+    stats
 }
 
 fn prune_expired(accounts: &mut HashMap<u64, HashMap<[u8; 32], PromptCacheEntry>>, now: Instant) {
@@ -546,6 +590,32 @@ fn flatten_claude_cache_blocks(req: &MessagesRequest) -> Vec<CacheableBlock> {
     }
 
     blocks
+}
+
+fn count_value_markers(value: &Value, stats: &mut PromptCacheRequestStats) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                count_value_markers(item, stats);
+            }
+        }
+        Value::Object(map) => {
+            if map.contains_key("cache_control") {
+                stats.cache_control_count += 1;
+            }
+            if map
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t == "image")
+            {
+                stats.image_count += 1;
+            }
+            for value in map.values() {
+                count_value_markers(value, stats);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn push_block(
@@ -794,6 +864,59 @@ mod tests {
             "messages": [{"role": "user", "content": "hello"}]
         }));
         assert!(tracker.build_claude_profile(&req).is_none());
+    }
+
+    #[test]
+    fn request_marker_stats_count_real_content_not_tool_schema() {
+        let req = request_from_json(json!({
+            "model": "claude-opus-5",
+            "max_tokens": 100,
+            "tools": [{
+                "name": "example",
+                "description": "example",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "cache_control": {"type": "string"},
+                        "asset": {"const": "image"}
+                    }
+                },
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "redacted"}},
+                    {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}
+                ]
+            }]
+        }));
+
+        let stats = inspect_claude_cache_markers(&req);
+        assert_eq!(stats.image_count, 1);
+        assert_eq!(stats.cache_control_count, 2);
+    }
+
+    #[test]
+    fn profile_observation_exposes_eligible_breakpoint_count() {
+        let tracker = PromptCacheTracker::new();
+        let req = request_from_json(json!({
+            "model": "claude-opus-5",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "short", "cache_control": {"type": "ephemeral"}}
+                ]
+            }]
+        }));
+
+        let profile = tracker
+            .build_claude_profile(&req)
+            .expect("explicit cache_control should build a profile");
+        assert_eq!(profile.breakpoint_count(), 1);
+        assert_eq!(profile.eligible_breakpoint_count(), 0);
+        assert_eq!(tracker.compute(1, &profile), PromptCacheUsage::default());
     }
 
     #[test]
