@@ -23,7 +23,10 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::cache_tracker::{CacheContext, build_usage_json_with_observation};
+use super::cache_tracker::{
+    CacheContext, PromptCacheRequestStats, PromptCacheUsage, build_usage_json_with_observation,
+    inspect_claude_cache_markers,
+};
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
@@ -370,6 +373,7 @@ pub async fn post_messages(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
+    let cache_request_stats = inspect_claude_cache_markers(&payload);
 
     // 构建缓存画像（请求无 cache_control 断点时为 None，usage 不附加 cache 字段）
     let cache_context = state
@@ -403,6 +407,7 @@ pub async fn post_messages(
             thinking_enabled,
             tool_name_map,
             cache_context,
+            cache_request_stats,
             capture,
         )
         .await
@@ -413,10 +418,12 @@ pub async fn post_messages(
             provider,
             &request_body,
             &payload.model,
+            "/v1/messages",
             input_tokens,
             extract_thinking,
             tool_name_map,
             cache_context,
+            cache_request_stats,
             capture,
         )
         .await
@@ -432,6 +439,7 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     cache_context: Option<CacheContext>,
+    cache_request_stats: PromptCacheRequestStats,
     mut capture: CaptureSession,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -471,6 +479,17 @@ async fn handle_stream_request(
         ctx.cache_usage = Some(usage);
         ctx.cache_usage_observation = Some(observation);
     }
+    log_cache_profile_observation(
+        "/v1/messages",
+        model,
+        true,
+        result.credential_id,
+        input_tokens,
+        None,
+        cache_request_stats,
+        cache_context.as_ref(),
+        ctx.cache_usage.as_ref(),
+    );
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -598,6 +617,50 @@ fn create_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
+fn log_cache_profile_observation(
+    endpoint: &'static str,
+    model: &str,
+    stream: bool,
+    credential_id: u64,
+    request_estimated_input: i32,
+    final_context_input: Option<i32>,
+    request_stats: PromptCacheRequestStats,
+    cache_context: Option<&CacheContext>,
+    cache_usage: Option<&PromptCacheUsage>,
+) {
+    let breakpoint_count = cache_context
+        .map(|cc| cc.profile.breakpoint_count())
+        .unwrap_or(0);
+    let eligible_breakpoint_count = cache_context
+        .map(|cc| cc.profile.eligible_breakpoint_count())
+        .unwrap_or(0);
+    let cache_creation_input_tokens = cache_usage
+        .map(|usage| usage.cache_creation_input_tokens)
+        .unwrap_or(0);
+    let cache_read_input_tokens = cache_usage
+        .map(|usage| usage.cache_read_input_tokens)
+        .unwrap_or(0);
+
+    tracing::info!(
+        endpoint = endpoint,
+        model = %model,
+        stream = stream,
+        credential_id = credential_id,
+        request_estimated_input = request_estimated_input.max(0),
+        final_context_input = ?final_context_input.map(|v| v.max(0)),
+        has_image = request_stats.image_count > 0,
+        image_count = request_stats.image_count,
+        cache_control_present = request_stats.cache_control_count > 0,
+        cache_control_count = request_stats.cache_control_count,
+        profile_built = cache_context.is_some(),
+        breakpoint_count = breakpoint_count,
+        eligible_breakpoint_count = eligible_breakpoint_count,
+        cache_creation_input_tokens = cache_creation_input_tokens,
+        cache_read_input_tokens = cache_read_input_tokens,
+        "kiro cache profile observation"
+    );
+}
+
 use super::converter::get_context_window_size;
 
 /// 处理非流式请求
@@ -605,10 +668,12 @@ async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
+    endpoint: &'static str,
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     cache_context: Option<CacheContext>,
+    cache_request_stats: PromptCacheRequestStats,
     mut capture: CaptureSession,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -817,6 +882,17 @@ async fn handle_non_stream_request(
 
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    log_cache_profile_observation(
+        endpoint,
+        model,
+        false,
+        result.credential_id,
+        input_tokens,
+        context_input_tokens,
+        cache_request_stats,
+        cache_context.as_ref(),
+        cache_usage.as_ref(),
+    );
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -1007,6 +1083,7 @@ pub async fn post_messages_cc(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
+    let cache_request_stats = inspect_claude_cache_markers(&payload);
 
     // 构建缓存画像（请求无 cache_control 断点时为 None，usage 不附加 cache 字段）
     let cache_context = state
@@ -1040,6 +1117,7 @@ pub async fn post_messages_cc(
             thinking_enabled,
             tool_name_map,
             cache_context,
+            cache_request_stats,
             capture,
         )
         .await
@@ -1050,10 +1128,12 @@ pub async fn post_messages_cc(
             provider,
             &request_body,
             &payload.model,
+            "/cc/v1/messages",
             input_tokens,
             extract_thinking,
             tool_name_map,
             cache_context,
+            cache_request_stats,
             capture,
         )
         .await
@@ -1072,6 +1152,7 @@ async fn handle_stream_request_buffered(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     cache_context: Option<CacheContext>,
+    cache_request_stats: PromptCacheRequestStats,
     mut capture: CaptureSession,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -1102,12 +1183,25 @@ async fn handle_stream_request_buffered(
 
     // 依据实际使用的凭据计算模拟缓存使用量并登记指纹。
     // 登记时机与 handle_stream_request 一致（2xx 即登记，tradeoff 见彼处注释）。
+    let mut cache_usage_for_log = None;
     if let Some(cc) = &cache_context {
         let usage = cc.tracker.compute(result.credential_id, &cc.profile);
         let observation = cc.usage_observation(&usage);
         cc.tracker.update(result.credential_id, &cc.profile);
         ctx.set_cache_usage_with_observation(usage, observation);
+        cache_usage_for_log = Some(usage);
     }
+    log_cache_profile_observation(
+        "/cc/v1/messages",
+        model,
+        true,
+        result.credential_id,
+        estimated_input_tokens,
+        None,
+        cache_request_stats,
+        cache_context.as_ref(),
+        cache_usage_for_log.as_ref(),
+    );
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(result.response, ctx, capture);
