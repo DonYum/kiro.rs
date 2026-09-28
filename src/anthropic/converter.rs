@@ -92,7 +92,14 @@ pub fn map_model(model: &str) -> Option<String> {
         }
     } else if model_lower.contains("opus") {
         if model_lower.contains("opus-5") {
-            Some("claude-opus-5".to_string())
+            // Match the version exactly: a new minor version must never silently
+            // fall back to Opus 5. Kiro's model catalog uses a dotted 5.5 ID.
+            let base = model_lower.strip_suffix("-thinking").unwrap_or(&model_lower);
+            match base.strip_prefix("claude-").unwrap_or(base) {
+                "opus-5-5" | "opus-5.5" => Some("claude-opus-5.5".to_string()),
+                "opus-5" => Some("claude-opus-5".to_string()),
+                _ => None,
+            }
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
         } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
@@ -118,7 +125,7 @@ pub fn map_model(model: &str) -> Option<String> {
 /// Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
-        Some(mapped) if mapped == "claude-sonnet-5" || mapped == "claude-opus-5" || mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6" || mapped == "claude-opus-4.7" || mapped == "claude-opus-4.8" => 1_000_000,
+        Some(mapped) if mapped == "claude-sonnet-5" || mapped == "claude-opus-5" || mapped == "claude-opus-5.5" || mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6" || mapped == "claude-opus-4.7" || mapped == "claude-opus-4.8" => 1_000_000,
         _ => 200_000,
     }
 }
@@ -632,7 +639,7 @@ fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
                 .output_config
                 .as_ref()
                 .map(|c| c.effort.as_str())
-                .unwrap_or("high");
+                .unwrap_or_else(|| if map_model(&req.model).as_deref() == Some("claude-opus-5.5") { "medium" } else { "high" });
             return Some(format!(
                 "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
                 effort
@@ -976,6 +983,24 @@ mod tests {
             map_model("claude-sonnet-4-5-20250929"),
             Some("claude-sonnet-4.5".to_string())
         );
+    }
+
+    #[test]
+    fn test_opus_55_mapping_and_outbound_model() {
+        for model in ["claude-opus-5-5", "claude-opus-5.5", "claude-opus-5-5-thinking", "claude-opus-5.5-thinking"] {
+            assert_eq!(map_model(model).as_deref(), Some("claude-opus-5.5"));
+            assert_eq!(get_context_window_size(model), 1_000_000);
+            let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": model, "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "hello"}]
+            })).unwrap();
+            let converted = convert_request(&request).unwrap();
+            let wire = serde_json::to_value(&converted.conversation_state).unwrap();
+            assert_eq!(wire["currentMessage"]["userInputMessage"]["modelId"], "claude-opus-5.5");
+        }
+        for model in ["claude-opus-5-6", "claude-opus-5.6", "claude-opus-5-50", "claude-opus-50"] {
+            assert_eq!(map_model(model), None);
+        }
     }
 
     #[test]

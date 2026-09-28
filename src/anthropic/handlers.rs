@@ -105,6 +105,24 @@ pub async fn get_models() -> impl IntoResponse {
 
     let models = vec![
         Model {
+            id: "claude-opus-5-5".to_string(),
+            object: "model".to_string(),
+            created: 1790035200,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
+            id: "claude-opus-5-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1790035200,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
             id: "claude-opus-5".to_string(),
             object: "model".to_string(),
             created: 1782777600, // Jun 30, 2026
@@ -951,9 +969,14 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     });
 
     if is_adaptive_thinking {
-        payload.output_config = Some(OutputConfig {
-            effort: "high".to_string(),
-        });
+        if super::converter::map_model(&payload.model).as_deref() == Some("claude-opus-5.5") {
+            // The live Kiro catalog defaults Opus 5.5 to medium; retain explicit effort.
+            payload.output_config.get_or_insert(OutputConfig { effort: "medium".to_string() });
+        } else {
+            payload.output_config = Some(OutputConfig {
+                effort: "high".to_string(),
+            });
+        }
     }
 }
 
@@ -1356,6 +1379,19 @@ mod tests {
         assert_eq!(payload.output_config.unwrap().effort, "high");
     }
 
+    #[test]
+    fn opus_55_thinking_uses_adaptive() {
+        for model in ["claude-opus-5-5-thinking", "claude-opus-5.5-thinking"] {
+            let mut payload = messages_request(model);
+            override_thinking_from_model_name(&mut payload);
+            assert_eq!(payload.thinking.as_ref().unwrap().thinking_type, "adaptive");
+            assert_eq!(payload.output_config.as_ref().unwrap().effort, "medium");
+            payload.output_config = Some(OutputConfig { effort: "xhigh".to_string() });
+            override_thinking_from_model_name(&mut payload);
+            assert_eq!(payload.output_config.unwrap().effort, "xhigh");
+        }
+    }
+
     #[tokio::test]
     async fn models_list_includes_opus_5_variants() {
         let response = get_models().await.into_response();
@@ -1370,6 +1406,8 @@ mod tests {
             .filter_map(|model| model["id"].as_str())
             .collect();
 
+        assert!(ids.contains(&"claude-opus-5-5"));
+        assert!(ids.contains(&"claude-opus-5-5-thinking"));
         assert!(ids.contains(&"claude-opus-5"));
         assert!(ids.contains(&"claude-opus-5-thinking"));
     }
