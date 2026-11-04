@@ -519,16 +519,13 @@ impl KiroProvider {
                         body
                     );
 
-                    let has_available = self.token_manager.report_failure(ctx.id);
-                    if !has_available {
-                        anyhow::bail!(
-                            "{} API 请求失败（所有凭据均不支持该模型或已不可用）: {} {}",
-                            api_type,
-                            status,
-                            body
-                        );
+                    // 本地策略：如果上游返回 INVALID_MODEL_ID，则说明此凭据（模型权限）不满足请求
+                    // 只做排除处理，不计入全局凭据故障计数（避免禁用账号）
+                    if !failed_ids.contains(&ctx.id) {
+                        failed_ids.push(ctx.id);
                     }
-
+                    tracing::info!("凭据 #{} 不支持该模型，已加入排除列表，强制切换凭据", ctx.id);
+                    
                     last_error = Some(anyhow::anyhow!(
                         "{} API 请求失败: {} {}",
                         api_type,
