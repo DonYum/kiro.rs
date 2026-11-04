@@ -57,9 +57,14 @@ impl MeteringRecorder {
     }
 
     pub fn commit(&self) {
-        if self.committed.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        if self
+            .committed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
             if let Some(credits) = *self.latest_credits.lock() {
-                self.token_manager.report_metering_usage(self.credential_id, credits);
+                self.token_manager
+                    .report_metering_usage(self.credential_id, credits);
             }
         }
     }
@@ -114,8 +119,8 @@ impl KiroProvider {
         );
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client
-        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
-            .expect("创建 HTTP 客户端失败");
+        let initial_client =
+            build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 
@@ -142,10 +147,7 @@ impl KiroProvider {
     }
 
     /// 根据凭据选择 endpoint 实现
-    fn endpoint_for(
-        &self,
-        credentials: &KiroCredentials,
-    ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+    fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
         let name = credentials
             .endpoint
             .as_deref()
@@ -289,7 +291,12 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(ctx.id)
+                        .await
+                        .is_ok()
+                    {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                         continue;
                     }
@@ -382,7 +389,8 @@ impl KiroProvider {
         let session_id = Self::extract_session_id_from_request(request_body);
         let max_retries = Self::compute_max_retries(
             total_credentials,
-            self.token_manager.available_count_for_model(model.as_deref()),
+            self.token_manager
+                .available_count_for_model(model.as_deref()),
         );
 
         for attempt in 0..max_retries {
@@ -521,10 +529,11 @@ impl KiroProvider {
 
                     // 本地策略：如果上游返回 INVALID_MODEL_ID，则说明此凭据（模型权限）不满足请求
                     // 只做排除处理，不计入全局凭据故障计数（避免禁用账号）
-                    if !failed_ids.contains(&ctx.id) {
-                        failed_ids.push(ctx.id);
-                    }
-                    tracing::info!("凭据 #{} 不支持该模型，已加入排除列表，强制切换凭据", ctx.id);
+                    Self::exclude_credential_for_request(&mut failed_ids, ctx.id);
+                    tracing::info!(
+                        "凭据 #{} 不支持该模型，已加入排除列表，强制切换凭据",
+                        ctx.id
+                    );
 
                     last_error = Some(anyhow::anyhow!(
                         "{} API 请求失败: {} {}",
@@ -551,7 +560,12 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(ctx.id)
+                        .await
+                        .is_ok()
+                    {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                         continue;
                     }
@@ -710,6 +724,12 @@ impl KiroProvider {
         lower.contains("invalid_model_id") || lower.contains("invalid model")
     }
 
+    fn exclude_credential_for_request(failed_ids: &mut Vec<u64>, credential_id: u64) {
+        if !failed_ids.contains(&credential_id) {
+            failed_ids.push(credential_id);
+        }
+    }
+
     fn compute_max_retries(total_credentials: usize, available: usize) -> usize {
         let budget = total_credentials.saturating_mul(MAX_RETRIES_PER_CREDENTIAL);
         let floor = available.max(1);
@@ -799,7 +819,10 @@ mod tests {
             KiroProvider::extract_session_id_from_request(r#"{"conversationState":{}}"#),
             None
         );
-        assert_eq!(KiroProvider::extract_session_id_from_request("not-json"), None);
+        assert_eq!(
+            KiroProvider::extract_session_id_from_request("not-json"),
+            None
+        );
     }
 
     #[test]
@@ -830,10 +853,7 @@ mod tests {
     #[test]
     fn test_classify_429_cooldown_and_capacity_exception() {
         assert_eq!(
-            KiroProvider::classify_429_cooldown(
-                r#"{"reason":"RATE_LIMIT_EXCEEDED"}"#,
-                None,
-            ),
+            KiroProvider::classify_429_cooldown(r#"{"reason":"RATE_LIMIT_EXCEEDED"}"#, None,),
             Some(Duration::from_secs(60))
         );
         assert_eq!(
@@ -860,9 +880,16 @@ mod tests {
     fn metering_recorder_commits_latest_value_once() {
         let mut credential = KiroCredentials::default();
         credential.id = Some(1);
-        let manager = Arc::new(MultiTokenManager::new(
-            crate::model::config::Config::default(), vec![credential], None, None, false,
-        ).unwrap());
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                vec![credential],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
         let recorder = MeteringRecorder {
             token_manager: manager.clone(),
             credential_id: 1,
@@ -873,31 +900,51 @@ mod tests {
         recorder.observe(Some(1.5));
         recorder.commit();
         recorder.commit();
+
+        let entry = manager.snapshot().entries.into_iter().next().unwrap();
+        assert_eq!(entry.metered_credits, 1.5);
+        assert_eq!(entry.metered_request_count, 1);
     }
 
-    #[test]
-    fn test_invalid_model_id_does_not_report_failure() {
-        use crate::kiro::token_manager::TokenManager;
-        use crate::model::config::Config;
-        use crate::kiro::model::credentials::{Credential, KiroCredentials};
+    #[tokio::test]
+    async fn test_invalid_model_id_excludes_credential_without_health_change() {
+        let mut first = KiroCredentials::default();
+        first.id = Some(310);
+        first.access_token = Some("token-310".to_string());
+        first.expires_at = Some("2999-01-01T00:00:00Z".to_string());
 
-        let mut creds = Vec::new();
-        creds.push(Credential { id: 310, priority: 0, disabled: false, ..Default::default() });
-        creds.push(Credential { id: 311, priority: 0, disabled: false, ..Default::default() });
+        let mut second = KiroCredentials::default();
+        second.id = Some(311);
+        second.access_token = Some("token-311".to_string());
+        second.expires_at = Some("2999-01-01T00:00:00Z".to_string());
 
-        let tm = TokenManager::new_from_parts(Config::default(), KiroCredentials { credentials: creds });
-        
-        // 模拟 310 INVALID_MODEL_ID
-        let ctx_id = 310;
+        let manager = MultiTokenManager::new(
+            crate::model::config::Config::default(),
+            vec![first, second],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let before = manager.snapshot();
+
+        // 模拟凭据 #310 收到 INVALID_MODEL_ID：只排除本次请求，不能更新全局健康状态。
         let mut failed_ids = Vec::new();
-        
-        // 模仿逻辑
-        if !failed_ids.contains(&ctx_id) {
-            failed_ids.push(ctx_id);
-        }
-        // 核心逻辑：这里不调用 tm.report_failure(ctx_id)
-        
-        assert!(failed_ids.contains(&310));
-        assert!(!tm.get_credential(310).unwrap().disabled); // 310 不应被禁用
+        KiroProvider::exclude_credential_for_request(&mut failed_ids, 310);
+        KiroProvider::exclude_credential_for_request(&mut failed_ids, 310);
+
+        let next = manager
+            .acquire_context_for_session_excluding(None, Some("session-a"), &failed_ids)
+            .await
+            .unwrap();
+        assert_eq!(failed_ids, vec![310]);
+        assert_eq!(next.id, 311);
+
+        let after = manager.snapshot();
+        let before_310 = before.entries.iter().find(|entry| entry.id == 310).unwrap();
+        let after_310 = after.entries.iter().find(|entry| entry.id == 310).unwrap();
+        assert_eq!(after_310.failure_count, before_310.failure_count);
+        assert_eq!(after_310.disabled, before_310.disabled);
+        assert_eq!(after_310.disabled_reason, before_310.disabled_reason);
     }
 }
