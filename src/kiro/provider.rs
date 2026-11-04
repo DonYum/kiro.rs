@@ -525,7 +525,7 @@ impl KiroProvider {
                         failed_ids.push(ctx.id);
                     }
                     tracing::info!("凭据 #{} 不支持该模型，已加入排除列表，强制切换凭据", ctx.id);
-                    
+
                     last_error = Some(anyhow::anyhow!(
                         "{} API 请求失败: {} {}",
                         api_type,
