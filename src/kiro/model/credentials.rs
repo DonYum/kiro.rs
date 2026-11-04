@@ -248,17 +248,10 @@ impl KiroCredentials {
 
     /// 检查凭据是否支持 Opus 模型
     ///
-    /// Free 账号不支持 Opus 模型，需要 PRO 或更高等级订阅
+    /// 允许尝试派发 Opus 请求。实际是否支持以 AWS 上游鑑权结果为准：
+    /// 若账号上游不支持 Opus，provider 层会自动捕获 400 INVALID_MODEL_ID 并故障转移
     pub fn supports_opus(&self) -> bool {
-        match &self.subscription_title {
-            Some(title) => {
-                let title_upper = title.to_uppercase();
-                // 如果包含 FREE，则不支持 Opus
-                !title_upper.contains("FREE")
-            }
-            // 如果还没有获取订阅信息，暂时允许（首次使用时会获取）
-            None => true,
-        }
+        true
     }
 
     /// 检查是否为 API Key 凭据
