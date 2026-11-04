@@ -873,33 +873,31 @@ mod tests {
         recorder.observe(Some(1.5));
         recorder.commit();
         recorder.commit();
-    #[cfg(test)]
-    mod tests {
-        use super::*;
+    }
+
+    #[test]
+    fn test_invalid_model_id_does_not_report_failure() {
         use crate::kiro::token_manager::TokenManager;
         use crate::model::config::Config;
         use crate::kiro::model::credentials::{Credential, KiroCredentials};
 
-        #[test]
-        fn test_invalid_model_id_does_not_report_failure() {
-            let mut creds = Vec::new();
-            creds.push(Credential { id: 310, priority: 0, disabled: false, ..Default::default() });
-            creds.push(Credential { id: 311, priority: 0, disabled: false, ..Default::default() });
+        let mut creds = Vec::new();
+        creds.push(Credential { id: 310, priority: 0, disabled: false, ..Default::default() });
+        creds.push(Credential { id: 311, priority: 0, disabled: false, ..Default::default() });
 
-            let tm = TokenManager::new_from_parts(Config::default(), KiroCredentials { credentials: creds });
-            
-            // 模拟 310 INVALID_MODEL_ID
-            let ctx_id = 310;
-            let mut failed_ids = Vec::new();
-            
-            // 模仿逻辑
-            if !failed_ids.contains(&ctx_id) {
-                failed_ids.push(ctx_id);
-            }
-            // 核心逻辑：这里不调用 tm.report_failure(ctx_id)
-            
-            assert!(failed_ids.contains(&310));
-            assert!(!tm.get_credential(310).unwrap().disabled); // 310 不应被禁用
+        let tm = TokenManager::new_from_parts(Config::default(), KiroCredentials { credentials: creds });
+        
+        // 模拟 310 INVALID_MODEL_ID
+        let ctx_id = 310;
+        let mut failed_ids = Vec::new();
+        
+        // 模仿逻辑
+        if !failed_ids.contains(&ctx_id) {
+            failed_ids.push(ctx_id);
         }
+        // 核心逻辑：这里不调用 tm.report_failure(ctx_id)
+        
+        assert!(failed_ids.contains(&310));
+        assert!(!tm.get_credential(310).unwrap().disabled); // 310 不应被禁用
     }
 }
