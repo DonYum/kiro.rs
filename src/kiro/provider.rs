@@ -934,7 +934,11 @@ mod tests {
         KiroProvider::exclude_credential_for_request(&mut failed_ids, 310);
 
         let next = manager
-            .acquire_context_for_session_excluding(None, Some("session-a"), &failed_ids)
+            .acquire_context_for_session_excluding(
+                Some("claude-opus-5-5"),
+                Some("session-a"),
+                &failed_ids,
+            )
             .await
             .unwrap();
         assert_eq!(failed_ids, vec![310]);
