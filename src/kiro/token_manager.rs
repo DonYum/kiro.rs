@@ -316,6 +316,7 @@ async fn refresh_idc_token(
     }
 
     let data: IdcRefreshResponse = response.json().await?;
+    let access_token = data.access_token.clone();
 
     let mut new_credentials = credentials.clone();
     new_credentials.access_token = Some(data.access_token);
@@ -334,7 +335,78 @@ async fn refresh_idc_token(
         new_credentials.profile_arn = Some(profile_arn);
     }
 
+    // AWS 上游自 2026-11 起对 IdC 凭据强制要求携带 profileArn；
+    // 若配置与 OIDC 响应均未包含 profile_arn，主动调 ListAvailableProfiles 自动补全。
+    if new_credentials
+        .profile_arn
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        match fetch_idc_profile_arn(&new_credentials, config, &access_token, proxy).await {
+            Ok(Some(arn)) => {
+                tracing::info!("IdC 刷新后自动获取并补全 profileArn: {}", arn);
+                new_credentials.profile_arn = Some(arn);
+            }
+            Ok(None) => {
+                tracing::warn!("IdC ListAvailableProfiles 返回空 profiles 列表");
+            }
+            Err(e) => {
+                tracing::warn!("IdC 自动获取 profileArn 失败（继续保留当前凭据）: {}", e);
+            }
+        }
+    }
+
     Ok(new_credentials)
+}
+
+/// 通过 AWS CodeWhisperer ListAvailableProfiles 接口自动发现 IdC 凭据绑定的首个 Profile ARN
+async fn fetch_idc_profile_arn(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<Option<String>> {
+    let api_region = credentials.effective_api_region(config);
+    let url = format!("https://q.{}.amazonaws.com/", api_region);
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let amz_user_agent = format!(
+        "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
+        config.kiro_version, machine_id
+    );
+    let client = build_client(proxy, 15, config.tls_backend)?;
+    let response = client
+        .post(&url)
+        .header("content-type", "application/x-amz-json-1.0")
+        .header(
+            "x-amz-target",
+            "AmazonCodeWhispererService.ListAvailableProfiles",
+        )
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &amz_user_agent)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Connection", "close")
+        .body("{}")
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        bail!("ListAvailableProfiles HTTP {}: {}", status, body_text);
+    }
+
+    let val: serde_json::Value = response.json().await?;
+    let arn = val
+        .get("profiles")
+        .and_then(|p| p.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|first| first.get("arn"))
+        .and_then(|a| a.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Ok(arn)
 }
 
 /// 获取使用额度信息
