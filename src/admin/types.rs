@@ -98,6 +98,10 @@ pub struct AddCredentialRequest {
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
     pub refresh_token: Option<String>,
 
+    /// CodeWhisperer Profile ARN（可选，IdC 凭据未传时会在刷新/校验阶段自动拉取补全）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_arn: Option<String>,
+
     /// 认证方式（可选，默认 social）
     #[serde(default = "default_auth_method")]
     pub auth_method: String,
