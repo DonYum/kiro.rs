@@ -37,6 +37,70 @@ const MAX_RATE_LIMIT_COOLDOWN_SECS: u64 = 300;
 pub struct ApiCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,
+    /// 流式请求探测首帧时已读出的首个数据块；必须排在 `response` 剩余 body 之前。
+    first_chunk: Option<bytes::Bytes>,
+}
+
+impl ApiCallResult {
+    /// 取出完整 body 流（先回放探测时读出的首个数据块，再接剩余 body）。
+    pub fn into_body_stream(
+        self,
+    ) -> impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> {
+        use futures::StreamExt;
+        futures::stream::iter(self.first_chunk.map(Ok)).chain(self.response.bytes_stream())
+    }
+}
+
+/// 上游返回 2xx 但 body 零字节（空流）时，同一请求内的额外重试次数。
+const EMPTY_STREAM_MAX_RETRIES: usize = 2;
+
+/// 读取流式响应的首个数据块。
+///
+/// 返回 `None` 表示上游 2xx 但 body 在任何字节之前就结束（或首包读取失败），
+/// 此时尚未向客户端写出任何内容，可以安全重试。
+async fn probe_first_chunk(mut result: ApiCallResult) -> Option<ApiCallResult> {
+    match result.response.chunk().await {
+        Ok(Some(chunk)) if !chunk.is_empty() => {
+            result.first_chunk = Some(chunk);
+            Some(result)
+        }
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!("读取流式首包失败，按空流处理: {}", e);
+            None
+        }
+    }
+}
+
+/// 空流时重试 `call`；每次重试都是整个请求级别的重试，不改变任何凭据的全局状态。
+async fn retry_on_empty_stream<F, Fut>(
+    max_retries: usize,
+    mut call: F,
+) -> anyhow::Result<ApiCallResult>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<ApiCallResult>>,
+{
+    for attempt in 0..=max_retries {
+        let result = call().await?;
+        let credential_id = result.credential_id;
+        if let Some(result) = probe_first_chunk(result).await {
+            return Ok(result);
+        }
+        tracing::warn!(
+            credential_id,
+            attempt = attempt + 1,
+            max_attempts = max_retries + 1,
+            "上游返回 2xx 但流为空（0 字节），不计入凭据失败，重试本次请求"
+        );
+        if attempt < max_retries {
+            sleep(KiroProvider::retry_delay(attempt)).await;
+        }
+    }
+    anyhow::bail!(
+        "流式 API 上游连续 {} 次返回空流（HTTP 2xx 但无任何数据）",
+        max_retries + 1
+    )
 }
 
 /// Collects the final metering value and persists it once per upstream request.
@@ -167,8 +231,13 @@ impl KiroProvider {
     }
 
     /// 发送流式 API 请求
+    ///
+    /// 会读取上游首个数据块：上游 2xx 但空流时在返回前重试，避免客户端收到空消息。
     pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<ApiCallResult> {
-        self.call_api_with_retry(request_body, true).await
+        retry_on_empty_stream(EMPTY_STREAM_MAX_RETRIES, || {
+            self.call_api_with_retry(request_body, true)
+        })
+        .await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -478,6 +547,7 @@ impl KiroProvider {
                 return Ok(ApiCallResult {
                     response,
                     credential_id: ctx.id,
+                    first_chunk: None,
                 });
             }
 
@@ -950,5 +1020,90 @@ mod tests {
         assert_eq!(after_310.failure_count, before_310.failure_count);
         assert_eq!(after_310.disabled, before_310.disabled);
         assert_eq!(after_310.disabled_reason, before_310.disabled_reason);
+    }
+
+    fn fake_result(body: &'static [u8], id: u64) -> ApiCallResult {
+        let response =
+            reqwest::Response::from(http::Response::new(bytes::Bytes::from_static(body)));
+        ApiCallResult {
+            response,
+            credential_id: id,
+            first_chunk: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_stream_is_retried_and_first_chunk_is_replayed() {
+        use futures::StreamExt;
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = retry_on_empty_stream(2, || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Ok(if n == 0 {
+                    fake_result(b"", 7)
+                } else {
+                    fake_result(b"hello", 7)
+                })
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(result.credential_id, 7);
+        let body: Vec<u8> = result
+            .into_body_stream()
+            .map(|c| c.unwrap().to_vec())
+            .concat()
+            .await;
+        assert_eq!(body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn empty_stream_exhausted_returns_error_without_touching_credential_health() {
+        let credential = KiroCredentials {
+            id: Some(401),
+            access_token: Some("t".to_string()),
+            expires_at: Some("2999-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let manager = MultiTokenManager::new(
+            crate::model::config::Config::default(),
+            vec![credential],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let before = manager.snapshot().entries.into_iter().next().unwrap();
+
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let err = retry_on_empty_stream(2, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok(fake_result(b"", 401)) }
+        })
+        .await
+        .err()
+        .expect("should fail after exhausting retries");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(err.to_string().contains("空流"));
+        let after = manager.snapshot().entries.into_iter().next().unwrap();
+        assert_eq!(after.failure_count, before.failure_count);
+        assert_eq!(after.disabled, before.disabled);
+    }
+
+    #[tokio::test]
+    async fn upstream_error_during_probe_retry_is_propagated_immediately() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let err = retry_on_empty_stream(2, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(anyhow::anyhow!("boom")) }
+        })
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(err.to_string(), "boom");
     }
 }

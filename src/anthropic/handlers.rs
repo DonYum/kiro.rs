@@ -531,7 +531,7 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(result.response, ctx, initial_events, capture);
+    let stream = create_sse_stream(result.into_body_stream(), ctx, initial_events, capture);
 
     // 返回 SSE 响应
     Response::builder()
@@ -553,7 +553,7 @@ fn create_ping_sse() -> Bytes {
 
 /// 创建 SSE 事件流
 fn create_sse_stream(
-    response: reqwest::Response,
+    body_stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
     capture: CaptureSession,
@@ -566,7 +566,6 @@ fn create_sse_stream(
     );
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
-    let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
         (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), Some(capture)),
@@ -1246,7 +1245,7 @@ async fn handle_stream_request_buffered(
     );
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(result.response, ctx, capture);
+    let stream = create_buffered_sse_stream(result.into_body_stream(), ctx, capture);
 
     // 返回 SSE 响应
     Response::builder()
@@ -1266,12 +1265,10 @@ async fn handle_stream_request_buffered(
 /// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
 /// 4. 一次性发送所有事件
 fn create_buffered_sse_stream(
-    response: reqwest::Response,
+    body_stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
     ctx: BufferedStreamContext,
     capture: CaptureSession,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let body_stream = response.bytes_stream();
-
     stream::unfold(
         (
             body_stream,
