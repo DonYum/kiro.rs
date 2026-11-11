@@ -1269,7 +1269,6 @@ fn create_buffered_sse_stream(
     ctx: BufferedStreamContext,
     capture: CaptureSession,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-
     stream::unfold(
         (
             body_stream,

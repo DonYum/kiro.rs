@@ -73,7 +73,10 @@ async fn probe_first_chunk(mut result: ApiCallResult) -> Option<ApiCallResult> {
 }
 
 /// 空流时重试 `call`；每次重试都是整个请求级别的重试，不改变任何凭据的全局状态。
-async fn retry_on_empty_stream<F, Fut>(max_retries: usize, mut call: F) -> anyhow::Result<ApiCallResult>
+async fn retry_on_empty_stream<F, Fut>(
+    max_retries: usize,
+    mut call: F,
+) -> anyhow::Result<ApiCallResult>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<ApiCallResult>>,
@@ -1020,7 +1023,8 @@ mod tests {
     }
 
     fn fake_result(body: &'static [u8], id: u64) -> ApiCallResult {
-        let response = reqwest::Response::from(http::Response::new(bytes::Bytes::from_static(body)));
+        let response =
+            reqwest::Response::from(http::Response::new(bytes::Bytes::from_static(body)));
         ApiCallResult {
             response,
             credential_id: id,
@@ -1057,10 +1061,12 @@ mod tests {
 
     #[tokio::test]
     async fn empty_stream_exhausted_returns_error_without_touching_credential_health() {
-        let mut credential = KiroCredentials::default();
-        credential.id = Some(401);
-        credential.access_token = Some("t".to_string());
-        credential.expires_at = Some("2999-01-01T00:00:00Z".to_string());
+        let credential = KiroCredentials {
+            id: Some(401),
+            access_token: Some("t".to_string()),
+            expires_at: Some("2999-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        };
         let manager = MultiTokenManager::new(
             crate::model::config::Config::default(),
             vec![credential],
