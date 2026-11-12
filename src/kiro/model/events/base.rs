@@ -18,6 +18,8 @@ pub enum EventType {
     ContextUsage,
     /// 推理内容事件（thinking 模型推理流）
     ReasoningContent,
+    /// 元数据事件（stopReason / token 用量等）
+    Metadata,
     /// 未知事件类型
     Unknown,
 }
@@ -31,6 +33,7 @@ impl EventType {
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
             "reasoningContentEvent" => Self::ReasoningContent,
+            "metadataEvent" => Self::Metadata,
             _ => Self::Unknown,
         }
     }
@@ -43,6 +46,7 @@ impl EventType {
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
             Self::ReasoningContent => "reasoningContentEvent",
+            Self::Metadata => "metadataEvent",
             Self::Unknown => "unknown",
         }
     }
@@ -77,6 +81,8 @@ pub enum Event {
     ContextUsage(super::ContextUsageEvent),
     /// 推理内容（thinking 模型推理流）
     ReasoningContent(super::ReasoningContentEvent),
+    /// 元数据（stopReason / stopDetails）
+    Metadata(super::MetadataEvent),
     /// 未知事件 (保留原始帧数据)
     Unknown {},
     /// 服务端错误
@@ -134,6 +140,10 @@ impl Event {
                 let payload = super::ReasoningContentEvent::from_frame(&frame)?;
                 Ok(Self::ReasoningContent(payload))
             }
+            EventType::Metadata => {
+                let payload = super::MetadataEvent::from_frame(&frame)?;
+                Ok(Self::Metadata(payload))
+            }
             EventType::Unknown => Ok(Self::Unknown {}),
         }
     }
@@ -185,6 +195,7 @@ mod tests {
             EventType::from_str("contextUsageEvent"),
             EventType::ContextUsage
         );
+        assert_eq!(EventType::from_str("metadataEvent"), EventType::Metadata);
         assert_eq!(EventType::from_str("unknown_type"), EventType::Unknown);
     }
 

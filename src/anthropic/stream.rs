@@ -13,6 +13,10 @@ use super::cache_tracker::{
 use crate::kiro::model::events::Event;
 use crate::kiro::provider::MeteringRecorder;
 
+/// 上游内容过滤拦截（`metadataEvent.stopReason = CONTENT_FILTERED`）映射到的
+/// Anthropic `stop_reason`。一经设置即为终态，后续事件不得覆盖。
+pub(super) const REFUSAL_STOP_REASON: &str = "refusal";
+
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
 /// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
@@ -287,6 +291,8 @@ pub struct SseStateManager {
     next_block_index: i32,
     /// 当前 stop_reason
     stop_reason: Option<String>,
+    /// `stop_reason = refusal` 时的 Anthropic `stop_details`
+    stop_details: Option<serde_json::Value>,
     /// 是否有工具调用
     has_tool_use: bool,
 }
@@ -306,6 +312,7 @@ impl SseStateManager {
             message_ended: false,
             next_block_index: 0,
             stop_reason: None,
+            stop_details: None,
             has_tool_use: false,
         }
     }
@@ -329,9 +336,22 @@ impl SseStateManager {
         self.has_tool_use = has;
     }
 
-    /// 设置 stop_reason
+    /// 设置 stop_reason。`refusal` 是终态：拦截后同一条流里再到的
+    /// contextUsage / exception 不得把它覆盖成 max_tokens 之类的可重试原因。
     pub fn set_stop_reason(&mut self, reason: impl Into<String>) {
+        if self.stop_reason.as_deref() == Some(REFUSAL_STOP_REASON) {
+            return;
+        }
         self.stop_reason = Some(reason.into());
+    }
+
+    /// 把上游 `CONTENT_FILTERED` 记成终态拒答，并保留官方 explanation。
+    pub fn set_content_filter_refusal(&mut self, details: serde_json::Value) {
+        if self.stop_reason.as_deref() == Some(REFUSAL_STOP_REASON) {
+            return;
+        }
+        self.stop_reason = Some(REFUSAL_STOP_REASON.to_string());
+        self.stop_details = Some(details);
     }
 
     /// 检查是否存在非 thinking 类型的内容块（如 text 或 tool_use）
@@ -479,14 +499,18 @@ impl SseStateManager {
         // 发送 message_delta
         if !self.message_delta_sent {
             self.message_delta_sent = true;
+            let mut delta = json!({
+                "stop_reason": self.get_stop_reason(),
+                "stop_sequence": null
+            });
+            if let Some(details) = &self.stop_details {
+                delta["stop_details"] = details.clone();
+            }
             events.push(SseEvent::new(
                 "message_delta",
                 json!({
                     "type": "message_delta",
-                    "delta": {
-                        "stop_reason": self.get_stop_reason(),
-                        "stop_sequence": null
-                    },
+                    "delta": delta,
                     "usage": build_usage_json_with_observation(
                         input_tokens,
                         output_tokens,
@@ -702,6 +726,14 @@ impl StreamContext {
                     output_tokens = metering.output_tokens,
                     "收到 Kiro meteringEvent"
                 );
+                Vec::new()
+            }
+            Event::Metadata(metadata) => {
+                if let Some(refusal) = metadata.content_filter_refusal() {
+                    tracing::warn!("上游内容过滤拒答: {}", refusal.summary());
+                    self.state_manager
+                        .set_content_filter_refusal(refusal.to_anthropic_stop_details());
+                }
                 Vec::new()
             }
             Event::Error {
@@ -1272,10 +1304,12 @@ impl StreamContext {
 
         // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
         // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
-        // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
+        // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块。
+        // 内容过滤拒答已经是终态，不能改写成 max_tokens，也不补伪造文本。
         if self.thinking_enabled
             && (had_thinking_block || self.thinking_block_index.is_some())
             && !self.state_manager.has_non_thinking_blocks()
+            && self.state_manager.get_stop_reason() != REFUSAL_STOP_REASON
         {
             self.state_manager.set_stop_reason("max_tokens");
             events.extend(self.create_text_delta_events(" "));
@@ -1473,6 +1507,105 @@ mod tests {
         assert!(all_events.iter().any(|e| {
             e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
         }));
+    }
+
+    const CONTENT_FILTERED_EXPLANATION: &str = "Your access to this model has been temporarily restricted due to excessive content refusals.";
+
+    fn content_filtered_frames() -> Vec<u8> {
+        use crate::kiro::parser::frame::encode_event_frame;
+        let metadata = serde_json::json!({
+            "stopDetails": {
+                "refusal": { "explanation": CONTENT_FILTERED_EXPLANATION }
+            },
+            "stopReason": "CONTENT_FILTERED"
+        });
+        let context = serde_json::json!({ "contextUsagePercentage": 100.0 });
+        let mut bytes = encode_event_frame("metadataEvent", metadata.to_string().as_bytes());
+        bytes.extend(encode_event_frame(
+            "contextUsageEvent",
+            context.to_string().as_bytes(),
+        ));
+        bytes
+    }
+
+    fn decode_events(bytes: &[u8]) -> Vec<Event> {
+        use crate::kiro::parser::decoder::EventStreamDecoder;
+        let mut decoder = EventStreamDecoder::new();
+        decoder.feed(bytes).unwrap();
+        decoder
+            .decode_iter()
+            .map(|frame| Event::from_frame(frame.expect("frame")).expect("event"))
+            .collect()
+    }
+
+    /// `/v1/messages` 流式：只有 metadataEvent CONTENT_FILTERED、没有 assistant 文本。
+    /// 随后的 contextUsage 100% 不得改写成 model_context_window_exceeded / end_turn。
+    #[test]
+    fn stream_messages_content_filtered_metadata_is_refusal_not_end_turn() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-5-5", 12, false, HashMap::new());
+        let mut events = ctx.generate_initial_events();
+        let mut saw_assistant_text = false;
+        for event in decode_events(&content_filtered_frames()) {
+            if let Event::AssistantResponse(resp) = &event
+                && !resp.content.is_empty()
+            {
+                saw_assistant_text = true;
+            }
+            events.extend(ctx.process_kiro_event(&event));
+        }
+        events.extend(ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "too long".to_string(),
+        }));
+        events.extend(ctx.generate_final_events());
+
+        assert!(!saw_assistant_text);
+        let message_delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "refusal");
+        assert_ne!(message_delta.data["delta"]["stop_reason"], "end_turn");
+        assert_eq!(
+            message_delta.data["delta"]["stop_details"]["type"],
+            "refusal"
+        );
+        assert_eq!(
+            message_delta.data["delta"]["stop_details"]["explanation"],
+            CONTENT_FILTERED_EXPLANATION
+        );
+        assert!(message_delta.data["delta"]["stop_details"]["category"].is_null());
+        let sse = events.iter().map(|e| e.to_sse_string()).collect::<String>();
+        assert!(sse.contains(r#""stop_reason":"refusal""#), "{sse}");
+        assert!(!sse.contains("end_turn"), "{sse}");
+        assert!(!sse.contains("model_context_window_exceeded"), "{sse}");
+        assert!(!sse.contains("max_tokens"), "{sse}");
+    }
+
+    /// 拒答后的纯 reasoning 流不能再被收尾逻辑改成 max_tokens。
+    #[test]
+    fn stream_reasoning_then_content_filter_stays_refusal() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-5-5", 12, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let mut events =
+            ctx.process_reasoning_content(&crate::kiro::model::events::ReasoningContentEvent {
+                text: "thinking".to_string(),
+                signature: None,
+                redacted_content: None,
+            });
+        for event in decode_events(&content_filtered_frames()) {
+            events.extend(ctx.process_kiro_event(&event));
+        }
+        events.extend(ctx.generate_final_events());
+
+        let message_delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "refusal");
+        assert_ne!(message_delta.data["delta"]["stop_reason"], "max_tokens");
+        assert_ne!(message_delta.data["delta"]["stop_reason"], "end_turn");
     }
 
     /// reasoning 流：signature_delta 必须在 content_block_stop 之前发出（Anthropic 协议）。
