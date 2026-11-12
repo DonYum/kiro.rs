@@ -153,6 +153,29 @@ pub fn parse_frame(buffer: &[u8]) -> ParseResult<Option<(Frame, usize)>> {
     Ok(Some((Frame { headers, payload }, total_length)))
 }
 
+/// 测试用：编码一条 `:message-type=event` 的 AWS Event Stream 帧。
+#[cfg(test)]
+pub(crate) fn encode_event_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
+    use super::crc::crc32;
+
+    let mut headers = Vec::new();
+    for (name, value) in [(":message-type", "event"), (":event-type", event_type)] {
+        headers.push(name.len() as u8);
+        headers.extend_from_slice(name.as_bytes());
+        headers.push(7);
+        headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        headers.extend_from_slice(value.as_bytes());
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&((16 + headers.len() + payload.len()) as u32).to_be_bytes());
+    out.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+    out.extend_from_slice(&crc32(&out).to_be_bytes());
+    out.extend(headers);
+    out.extend_from_slice(payload);
+    out.extend_from_slice(&crc32(&out).to_be_bytes());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

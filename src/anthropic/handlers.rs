@@ -697,6 +697,159 @@ fn log_cache_profile_observation(
 }
 
 use super::converter::get_context_window_size;
+use super::stream::REFUSAL_STOP_REASON;
+
+/// `/v1/messages` 非流式路径累积的一轮上游事件。
+struct NonStreamTurn {
+    text_content: String,
+    reasoning_text: String,
+    reasoning_signature: Option<String>,
+    tool_uses: Vec<serde_json::Value>,
+    has_tool_use: bool,
+    stop_reason: String,
+    stop_details: Option<serde_json::Value>,
+    refused: bool,
+    context_input_tokens: Option<i32>,
+    tool_json_buffers: std::collections::HashMap<String, String>,
+}
+
+impl NonStreamTurn {
+    fn new() -> Self {
+        Self {
+            text_content: String::new(),
+            reasoning_text: String::new(),
+            reasoning_signature: None,
+            tool_uses: Vec::new(),
+            has_tool_use: false,
+            stop_reason: "end_turn".to_string(),
+            stop_details: None,
+            refused: false,
+            context_input_tokens: None,
+            tool_json_buffers: std::collections::HashMap::new(),
+        }
+    }
+
+    fn apply(
+        &mut self,
+        event: Event,
+        model: &str,
+        tool_name_map: &std::collections::HashMap<String, String>,
+        metering_recorder: Option<&crate::kiro::provider::MeteringRecorder>,
+    ) {
+        match event {
+            Event::AssistantResponse(resp) => {
+                self.text_content.push_str(&resp.content);
+            }
+            Event::ReasoningContent(reasoning) => {
+                self.reasoning_text.push_str(&reasoning.text);
+                if let Some(sig) = reasoning.signature {
+                    self.reasoning_signature = Some(sig);
+                }
+            }
+            Event::ToolUse(tool_use) => {
+                self.has_tool_use = true;
+
+                self.tool_json_buffers
+                    .entry(tool_use.tool_use_id.clone())
+                    .or_default()
+                    .push_str(&tool_use.input);
+
+                if tool_use.stop {
+                    let input = {
+                        let buffer = self
+                            .tool_json_buffers
+                            .get(&tool_use.tool_use_id)
+                            .map(String::as_str)
+                            .unwrap_or("");
+                        if buffer.is_empty() {
+                            serde_json::json!({})
+                        } else {
+                            serde_json::from_str(buffer).unwrap_or_else(|e| {
+                                tracing::warn!(
+                                    "工具输入 JSON 解析失败: {}, tool_use_id: {}",
+                                    e,
+                                    tool_use.tool_use_id
+                                );
+                                serde_json::json!({})
+                            })
+                        }
+                    };
+
+                    let original_name = tool_name_map
+                        .get(&tool_use.name)
+                        .cloned()
+                        .unwrap_or_else(|| tool_use.name.clone());
+
+                    self.tool_uses.push(json!({
+                        "type": "tool_use",
+                        "id": tool_use.tool_use_id,
+                        "name": original_name,
+                        "input": input
+                    }));
+                }
+            }
+            Event::ContextUsage(context_usage) => {
+                let window_size = get_context_window_size(model);
+                let actual_input_tokens =
+                    (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
+                self.context_input_tokens = Some(actual_input_tokens);
+                // 拒答是终态，后到的 100% contextUsage 不得改写成可重试的窗口溢出。
+                if context_usage.context_usage_percentage >= 100.0 && !self.refused {
+                    self.stop_reason = "model_context_window_exceeded".to_string();
+                }
+                tracing::debug!(
+                    "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
+                    context_usage.context_usage_percentage,
+                    actual_input_tokens
+                );
+            }
+            Event::Metering(metering) => {
+                if let Some(recorder) = metering_recorder {
+                    recorder.observe(metering.usage);
+                }
+                tracing::debug!(
+                    credits = metering.usage,
+                    input_tokens = metering.input_tokens,
+                    output_tokens = metering.output_tokens,
+                    "收到 Kiro meteringEvent"
+                );
+            }
+            Event::Metadata(metadata) => {
+                if let Some(refusal) = metadata.content_filter_refusal() {
+                    tracing::warn!("上游内容过滤拒答: {}", refusal.summary());
+                    self.refused = true;
+                    self.stop_reason = REFUSAL_STOP_REASON.to_string();
+                    self.stop_details = Some(refusal.to_anthropic_stop_details());
+                }
+            }
+            Event::Exception { exception_type, .. }
+                if exception_type == "ContentLengthExceededException" && !self.refused =>
+            {
+                self.stop_reason = "max_tokens".to_string();
+            }
+            _ => {}
+        }
+    }
+
+    /// 非流式 `/v1/messages` 最终写入响应的 stop_reason 与 stop_details。
+    /// 拒答优先于同流内的 tool_use / max_tokens / 上下文溢出。
+    fn anthropic_stop(&self) -> (String, Option<serde_json::Value>) {
+        if self.refused {
+            let details = self.stop_details.clone().unwrap_or_else(|| {
+                json!({
+                    "type": "refusal",
+                    "category": null,
+                    "explanation": null
+                })
+            });
+            return (REFUSAL_STOP_REASON.to_string(), Some(details));
+        }
+        if self.has_tool_use && self.stop_reason == "end_turn" {
+            return ("tool_use".to_string(), None);
+        }
+        (self.stop_reason.clone(), None)
+    }
+}
 
 /// 处理非流式请求
 async fn handle_non_stream_request(
@@ -755,106 +908,15 @@ async fn handle_non_stream_request(
         tracing::warn!("缓冲区溢出: {}", e);
     }
 
-    let mut text_content = String::new();
-    // reasoningContentEvent 累积（thinking 模型独立推理流），最终作为 thinking content block 返回
-    let mut reasoning_text = String::new();
-    let mut reasoning_signature: Option<String> = None;
-    let mut tool_uses: Vec<serde_json::Value> = Vec::new();
-    let mut has_tool_use = false;
-    let mut stop_reason = "end_turn".to_string();
-    // 从 contextUsageEvent 计算的实际输入 tokens
-    let mut context_input_tokens: Option<i32> = None;
+    let mut turn = NonStreamTurn::new();
     let metering_recorder = provider.metering_recorder(result.credential_id);
-
-    // 收集工具调用的增量 JSON
-    let mut tool_json_buffers: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
 
     for result in decoder.decode_iter() {
         match result {
             Ok(frame) => {
                 capture.record_frame(&frame);
                 if let Ok(event) = Event::from_frame(frame) {
-                    match event {
-                        Event::AssistantResponse(resp) => {
-                            text_content.push_str(&resp.content);
-                        }
-                        Event::ReasoningContent(reasoning) => {
-                            reasoning_text.push_str(&reasoning.text);
-                            if let Some(sig) = reasoning.signature {
-                                reasoning_signature = Some(sig);
-                            }
-                        }
-                        Event::ToolUse(tool_use) => {
-                            has_tool_use = true;
-
-                            // 累积工具的 JSON 输入
-                            let buffer = tool_json_buffers
-                                .entry(tool_use.tool_use_id.clone())
-                                .or_insert_with(String::new);
-                            buffer.push_str(&tool_use.input);
-
-                            // 如果是完整的工具调用，添加到列表
-                            if tool_use.stop {
-                                let input: serde_json::Value = if buffer.is_empty() {
-                                    serde_json::json!({})
-                                } else {
-                                    serde_json::from_str(buffer).unwrap_or_else(|e| {
-                                        tracing::warn!(
-                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                            e,
-                                            tool_use.tool_use_id
-                                        );
-                                        serde_json::json!({})
-                                    })
-                                };
-
-                                let original_name = tool_name_map
-                                    .get(&tool_use.name)
-                                    .cloned()
-                                    .unwrap_or_else(|| tool_use.name.clone());
-
-                                tool_uses.push(json!({
-                                    "type": "tool_use",
-                                    "id": tool_use.tool_use_id,
-                                    "name": original_name,
-                                    "input": input
-                                }));
-                            }
-                        }
-                        Event::ContextUsage(context_usage) => {
-                            // 从上下文使用百分比计算实际的 input_tokens
-                            let window_size = get_context_window_size(model);
-                            let actual_input_tokens =
-                                (context_usage.context_usage_percentage * (window_size as f64)
-                                    / 100.0) as i32;
-                            context_input_tokens = Some(actual_input_tokens);
-                            // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                            if context_usage.context_usage_percentage >= 100.0 {
-                                stop_reason = "model_context_window_exceeded".to_string();
-                            }
-                            tracing::debug!(
-                                "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
-                                context_usage.context_usage_percentage,
-                                actual_input_tokens
-                            );
-                        }
-                        Event::Metering(metering) => {
-                            metering_recorder.observe(metering.usage);
-                            tracing::debug!(
-                                credits = metering.usage,
-                                input_tokens = metering.input_tokens,
-                                output_tokens = metering.output_tokens,
-                                "收到 Kiro meteringEvent"
-                            );
-                        }
-                        Event::Exception { exception_type, .. } => {
-                            if exception_type == "ContentLengthExceededException" {
-                                stop_reason = "max_tokens".to_string();
-                            }
-                        }
-                        _ => {}
-                    }
+                    turn.apply(event, model, &tool_name_map, Some(&metering_recorder));
                 }
             }
             Err(e) => {
@@ -865,10 +927,12 @@ async fn handle_non_stream_request(
 
     metering_recorder.commit();
 
-    // 确定 stop_reason
-    if has_tool_use && stop_reason == "end_turn" {
-        stop_reason = "tool_use".to_string();
-    }
+    let (stop_reason, stop_details) = turn.anthropic_stop();
+    let text_content = turn.text_content;
+    let reasoning_text = turn.reasoning_text;
+    let reasoning_signature = turn.reasoning_signature;
+    let tool_uses = turn.tool_uses;
+    let context_input_tokens = turn.context_input_tokens;
 
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
@@ -930,7 +994,7 @@ async fn handle_non_stream_request(
     );
 
     // 构建 Anthropic 响应
-    let response_body = json!({
+    let mut response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
         "type": "message",
         "role": "assistant",
@@ -946,6 +1010,9 @@ async fn handle_non_stream_request(
             cache_observation.as_ref(),
         )
     });
+    if let Some(details) = stop_details {
+        response_body["stop_details"] = details;
+    }
 
     capture.finish("complete", None).await;
 
@@ -989,7 +1056,9 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     if is_adaptive_thinking {
         if super::converter::map_model(&payload.model).as_deref() == Some("claude-opus-5.5") {
             // The live Kiro catalog defaults Opus 5.5 to medium; retain explicit effort.
-            payload.output_config.get_or_insert(OutputConfig { effort: "medium".to_string() });
+            payload.output_config.get_or_insert(OutputConfig {
+                effort: "medium".to_string(),
+            });
         } else {
             payload.output_config = Some(OutputConfig {
                 effort: "high".to_string(),
@@ -1402,7 +1471,9 @@ mod tests {
             override_thinking_from_model_name(&mut payload);
             assert_eq!(payload.thinking.as_ref().unwrap().thinking_type, "adaptive");
             assert_eq!(payload.output_config.as_ref().unwrap().effort, "medium");
-            payload.output_config = Some(OutputConfig { effort: "xhigh".to_string() });
+            payload.output_config = Some(OutputConfig {
+                effort: "xhigh".to_string(),
+            });
             override_thinking_from_model_name(&mut payload);
             assert_eq!(payload.output_config.unwrap().effort, "xhigh");
         }
@@ -1428,5 +1499,74 @@ mod tests {
         assert!(ids.contains(&"claude-opus-5-5-thinking"));
         assert!(ids.contains(&"claude-opus-5"));
         assert!(ids.contains(&"claude-opus-5-thinking"));
+    }
+
+    /// `/v1/messages` 非流式：metadataEvent CONTENT_FILTERED、没有 assistant 文本。
+    /// 随后的 contextUsage 100% 不得把拒答改成 end_turn 或 model_context_window_exceeded。
+    #[test]
+    fn non_stream_messages_content_filtered_metadata_is_refusal_not_end_turn() {
+        use crate::kiro::parser::decoder::EventStreamDecoder;
+        use crate::kiro::parser::frame::encode_event_frame;
+
+        let explanation = "Your access to this model has been temporarily restricted due to excessive content refusals.";
+        let metadata = serde_json::json!({
+            "stopDetails": { "refusal": { "explanation": explanation } },
+            "stopReason": "CONTENT_FILTERED"
+        });
+        let context = serde_json::json!({ "contextUsagePercentage": 100.0 });
+        let mut bytes = encode_event_frame("metadataEvent", metadata.to_string().as_bytes());
+        bytes.extend(encode_event_frame(
+            "contextUsageEvent",
+            context.to_string().as_bytes(),
+        ));
+
+        let mut decoder = EventStreamDecoder::new();
+        decoder.feed(&bytes).unwrap();
+        let mut turn = NonStreamTurn::new();
+        let mut saw_assistant_text = false;
+        for frame in decoder.decode_iter() {
+            let event = Event::from_frame(frame.expect("frame")).expect("event");
+            if let Event::AssistantResponse(resp) = &event
+                && !resp.content.is_empty()
+            {
+                saw_assistant_text = true;
+            }
+            turn.apply(
+                event,
+                "claude-opus-5-5",
+                &std::collections::HashMap::new(),
+                None,
+            );
+        }
+        turn.apply(
+            Event::Exception {
+                exception_type: "ContentLengthExceededException".to_string(),
+                message: "too long".to_string(),
+            },
+            "claude-opus-5-5",
+            &std::collections::HashMap::new(),
+            None,
+        );
+
+        assert!(!saw_assistant_text);
+        assert!(turn.text_content.is_empty());
+        let (stop_reason, stop_details) = turn.anthropic_stop();
+        let mut body = json!({
+            "role": "assistant",
+            "content": [],
+            "stop_reason": stop_reason,
+            "stop_sequence": null
+        });
+        if let Some(details) = stop_details {
+            body["stop_details"] = details;
+        }
+        assert_eq!(body["stop_reason"], "refusal");
+        assert_ne!(body["stop_reason"], "end_turn");
+        assert_ne!(body["stop_reason"], "model_context_window_exceeded");
+        assert_ne!(body["stop_reason"], "max_tokens");
+        assert_eq!(body["stop_details"]["type"], "refusal");
+        assert_eq!(body["stop_details"]["explanation"], explanation);
+        assert!(body["stop_details"]["category"].is_null());
+        assert!(body["content"].as_array().unwrap().is_empty());
     }
 }
