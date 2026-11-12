@@ -124,7 +124,7 @@ impl CaptureSession {
 
         let remaining = self.max_bytes.saturating_sub(self.document.captured_bytes);
         if payload.len() > remaining {
-            let end = floor_char_boundary(&payload, remaining);
+            let end = floor_char_boundary(payload, remaining);
             self.document.upstream_events.push(CapturedEvent {
                 sequence: self.document.upstream_events.len(),
                 message_type,

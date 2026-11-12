@@ -454,6 +454,7 @@ pub fn constrain_cache_usage_to_final_input(
 }
 
 /// 构建 usage JSON。携带缓存使用量时附加 cache 相关字段。
+#[allow(dead_code)] // 生产路径走 build_usage_json_with_observation；单元测试直接调用此函数。
 pub fn build_usage_json(
     input_tokens: i32,
     output_tokens: i32,
@@ -483,24 +484,23 @@ pub fn build_usage_json_with_observation(
         constrained_cache.as_ref(),
         observation,
         final_context_input,
-    ) {
-        if before != after {
-            tracing::info!(
-                model = %obs.model,
-                context_window = obs.context_window,
-                request_estimated_input = obs.request_estimated_input,
-                final_context_input = final_input_tokens.max(0),
-                breakpoint_count = obs.breakpoint_count,
-                cache_cap = obs.cache_cap,
-                cache_hit = obs.cache_hit,
-                cache_miss = obs.cache_miss,
-                cache_creation_before = before.cache_creation_input_tokens,
-                cache_read_before = before.cache_read_input_tokens,
-                cache_creation_after = after.cache_creation_input_tokens,
-                cache_read_after = after.cache_read_input_tokens,
-                "constrained simulated cache usage to final context input"
-            );
-        }
+    ) && before != after
+    {
+        tracing::info!(
+            model = %obs.model,
+            context_window = obs.context_window,
+            request_estimated_input = obs.request_estimated_input,
+            final_context_input = final_input_tokens.max(0),
+            breakpoint_count = obs.breakpoint_count,
+            cache_cap = obs.cache_cap,
+            cache_hit = obs.cache_hit,
+            cache_miss = obs.cache_miss,
+            cache_creation_before = before.cache_creation_input_tokens,
+            cache_read_before = before.cache_read_input_tokens,
+            cache_creation_after = after.cache_creation_input_tokens,
+            cache_read_after = after.cache_read_input_tokens,
+            "constrained simulated cache usage to final context input"
+        );
     }
 
     let mut usage = json!({
@@ -641,10 +641,11 @@ fn is_billing_header_block(value: &Value) -> bool {
         return false;
     };
     // 只处理 text 块（或没有显式 type 但含 text 的块）
-    if let Some(block_type) = obj.get("type").and_then(Value::as_str) {
-        if !block_type.is_empty() && block_type != "text" {
-            return false;
-        }
+    if let Some(block_type) = obj.get("type").and_then(Value::as_str)
+        && !block_type.is_empty()
+        && block_type != "text"
+    {
+        return false;
     }
     let Some(text) = obj.get("text").and_then(Value::as_str) else {
         return false;
