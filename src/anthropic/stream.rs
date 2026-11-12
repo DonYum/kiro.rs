@@ -42,10 +42,7 @@ fn find_char_boundary(s: &str, target: usize) -> usize {
 /// - 反引号 (`)：行内代码
 /// - 双引号 (")：字符串
 /// - 单引号 (')：字符串
-const QUOTE_CHARS: &[u8] = &[
-    b'`', b'"', b'\'', b'\\', b'#', b'!', b'@', b'$', b'%', b'^', b'&', b'*', b'(', b')', b'-',
-    b'_', b'=', b'+', b'[', b']', b'{', b'}', b';', b':', b'<', b'>', b',', b'.', b'?', b'/',
-];
+const QUOTE_CHARS: &[u8] = b"`\"'\\#!@$%^&*()-_=+[]{};:<>,.?/";
 
 /// 检查指定位置的字符是否是引用字符
 fn is_quote_char(buffer: &str, pos: usize) -> bool {
@@ -960,12 +957,12 @@ impl StreamContext {
                 if let Some(end_pos) = find_real_thinking_end_tag(&self.thinking_buffer) {
                     // 提取 thinking 内容
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                    if !thinking_content.is_empty() {
-                        if let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
-                        }
+                    if !thinking_content.is_empty()
+                        && let Some(thinking_index) = self.thinking_block_index
+                    {
+                        events.push(
+                            self.create_thinking_delta_event(thinking_index, &thinking_content),
+                        );
                     }
 
                     // 结束 thinking 块
@@ -1001,12 +998,12 @@ impl StreamContext {
                     let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
-                        if !safe_content.is_empty() {
-                            if let Some(thinking_index) = self.thinking_block_index {
-                                events.push(
-                                    self.create_thinking_delta_event(thinking_index, &safe_content),
-                                );
-                            }
+                        if !safe_content.is_empty()
+                            && let Some(thinking_index) = self.thinking_block_index
+                        {
+                            events.push(
+                                self.create_thinking_delta_event(thinking_index, &safe_content),
+                            );
                         }
                         self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
                     }
@@ -1037,10 +1034,10 @@ impl StreamContext {
 
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
         // 则丢弃该索引并创建新的文本块继续输出，避免 delta 被状态机拒绝导致“吞字”。
-        if let Some(idx) = self.text_block_index {
-            if !self.state_manager.is_block_open_of_type(idx, "text") {
-                self.text_block_index = None;
-            }
+        if let Some(idx) = self.text_block_index
+            && !self.state_manager.is_block_open_of_type(idx, "text")
+        {
+            self.text_block_index = None;
         }
 
         // 获取或创建文本块索引
@@ -1114,39 +1111,38 @@ impl StreamContext {
         // 但当 `</thinking>` 后面没有 `\n\n`（例如紧跟 tool_use 或流结束）时，
         // thinking 结束标签会滞留在 thinking_buffer，导致后续 flush 时把 `</thinking>` 当作内容输出。
         // 这里在开始 tool_use block 前做一次“边界场景”的结束标签识别与过滤。
-        if self.thinking_enabled && self.in_thinking_block {
-            if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer) {
-                let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                if !thinking_content.is_empty() {
-                    if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(
-                            self.create_thinking_delta_event(thinking_index, &thinking_content),
-                        );
-                    }
-                }
+        if self.thinking_enabled
+            && self.in_thinking_block
+            && let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer)
+        {
+            let thinking_content = self.thinking_buffer[..end_pos].to_string();
+            if !thinking_content.is_empty()
+                && let Some(thinking_index) = self.thinking_block_index
+            {
+                events.push(self.create_thinking_delta_event(thinking_index, &thinking_content));
+            }
 
-                // 结束 thinking 块
-                self.in_thinking_block = false;
-                self.thinking_extracted = true;
+            // 结束 thinking 块
+            self.in_thinking_block = false;
+            self.thinking_extracted = true;
 
-                if let Some(thinking_index) = self.thinking_block_index {
-                    // 先发送空的 thinking_delta
-                    events.push(self.create_thinking_delta_event(thinking_index, ""));
-                    // 再发送 content_block_stop
-                    if let Some(stop_event) =
-                        self.state_manager.handle_content_block_stop(thinking_index)
-                    {
-                        events.push(stop_event);
-                    }
+            if let Some(thinking_index) = self.thinking_block_index {
+                // 先发送空的 thinking_delta
+                events.push(self.create_thinking_delta_event(thinking_index, ""));
+                // 再发送 content_block_stop
+                if let Some(stop_event) =
+                    self.state_manager.handle_content_block_stop(thinking_index)
+                {
+                    events.push(stop_event);
                 }
+            }
 
-                // 把结束标签后的内容当作普通文本（通常为空或空白）
-                let after_pos = end_pos + "</thinking>".len();
-                let remaining = self.thinking_buffer[after_pos..].trim_start().to_string();
-                self.thinking_buffer.clear();
-                if !remaining.is_empty() {
-                    events.extend(self.create_text_delta_events(&remaining));
-                }
+            // 把结束标签后的内容当作普通文本（通常为空或空白）
+            let after_pos = end_pos + "</thinking>".len();
+            let remaining = self.thinking_buffer[after_pos..].trim_start().to_string();
+            self.thinking_buffer.clear();
+            if !remaining.is_empty() {
+                events.extend(self.create_text_delta_events(&remaining));
             }
         }
 
@@ -1216,10 +1212,10 @@ impl StreamContext {
         }
 
         // 如果是完整的工具调用（stop=true），发送 content_block_stop
-        if tool_use.stop {
-            if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
-                events.push(stop_event);
-            }
+        if tool_use.stop
+            && let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index)
+        {
+            events.push(stop_event);
         }
 
         events
@@ -1248,12 +1244,12 @@ impl StreamContext {
                     find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer)
                 {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                    if !thinking_content.is_empty() {
-                        if let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
-                        }
+                    if !thinking_content.is_empty()
+                        && let Some(thinking_index) = self.thinking_block_index
+                    {
+                        events.push(
+                            self.create_thinking_delta_event(thinking_index, &thinking_content),
+                        );
                     }
 
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
@@ -1375,11 +1371,6 @@ impl BufferedStreamContext {
         }
     }
 
-    /// 设置模拟缓存使用量（在凭据确定后调用）
-    pub fn set_cache_usage(&mut self, usage: PromptCacheUsage) {
-        self.inner.cache_usage = Some(usage);
-    }
-
     pub fn set_metering_recorder(&mut self, recorder: MeteringRecorder) {
         self.inner.set_metering_recorder(recorder);
     }
@@ -1443,12 +1434,11 @@ impl BufferedStreamContext {
             None,
         );
         for event in &mut self.event_buffer {
-            if event.event == "message_start" {
-                if let Some(message) = event.data.get_mut("message") {
-                    if let Some(usage) = message.get_mut("usage") {
-                        *usage = corrected_usage.clone();
-                    }
-                }
+            if event.event == "message_start"
+                && let Some(message) = event.data.get_mut("message")
+                && let Some(usage) = message.get_mut("usage")
+            {
+                *usage = corrected_usage.clone();
             }
         }
 

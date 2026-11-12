@@ -6,15 +6,11 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum TlsBackend {
+    #[default]
     Rustls,
     NativeTls,
-}
-
-impl Default for TlsBackend {
-    fn default() -> Self {
-        Self::Rustls
-    }
 }
 
 /// KNA 应用配置
@@ -212,9 +208,10 @@ impl Config {
         let path = path.as_ref();
         if !path.exists() {
             // 配置文件不存在，返回默认配置
-            let mut config = Self::default();
-            config.config_path = Some(path.to_path_buf());
-            return Ok(config);
+            return Ok(Self {
+                config_path: Some(path.to_path_buf()),
+                ..Self::default()
+            });
         }
 
         let content = fs::read_to_string(path)?;
@@ -236,7 +233,8 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        fs::write(path, content)
+            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }
 }

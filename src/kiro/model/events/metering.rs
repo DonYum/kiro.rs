@@ -31,10 +31,8 @@ mod tests {
 
     #[test]
     fn deserializes_metering_credits() {
-        let event: MeteringEvent = serde_json::from_str(
-            r#"{"usage":1.25,"inputTokens":100,"outputTokens":20}"#,
-        )
-        .unwrap();
+        let event: MeteringEvent =
+            serde_json::from_str(r#"{"usage":1.25,"inputTokens":100,"outputTokens":20}"#).unwrap();
         assert_eq!(event.usage, Some(1.25));
         assert_eq!(event.input_tokens, Some(100));
         assert_eq!(event.output_tokens, Some(20));

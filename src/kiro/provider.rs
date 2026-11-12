@@ -125,11 +125,10 @@ impl MeteringRecorder {
             .committed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+            && let Some(credits) = *self.latest_credits.lock()
         {
-            if let Some(credits) = *self.latest_credits.lock() {
-                self.token_manager
-                    .report_metering_usage(self.credential_id, credits);
-            }
+            self.token_manager
+                .report_metering_usage(self.credential_id, credits);
         }
     }
 }
@@ -870,6 +869,7 @@ impl KiroProvider {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 

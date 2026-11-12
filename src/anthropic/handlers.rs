@@ -467,6 +467,7 @@ pub async fn post_messages(
 }
 
 /// 处理流式请求
+#[allow(clippy::too_many_arguments)]
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -652,6 +653,7 @@ fn create_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn log_cache_profile_observation(
     endpoint: &'static str,
     model: &str,
@@ -852,6 +854,7 @@ impl NonStreamTurn {
 }
 
 /// 处理非流式请求
+#[allow(clippy::too_many_arguments)]
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -1087,7 +1090,7 @@ pub async fn count_tokens(
     ) as i32;
 
     Json(CountTokensResponse {
-        input_tokens: total_tokens.max(1) as i32,
+        input_tokens: total_tokens.max(1),
     })
 }
 
@@ -1254,6 +1257,7 @@ pub async fn post_messages_cc(
 ///
 /// 与 `handle_stream_request` 不同，此函数会缓冲所有事件直到流结束，
 /// 然后用从 contextUsageEvent 计算的正确 input_tokens 生成 message_start 事件。
+#[allow(clippy::too_many_arguments)]
 async fn handle_stream_request_buffered(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,

@@ -133,6 +133,7 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
 /// - 数组格式（新格式，支持多凭据）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum CredentialsConfig {
     /// 单个凭据（旧格式）
     Single(KiroCredentials),
@@ -279,6 +280,7 @@ impl KiroCredentials {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::model::config::Config;

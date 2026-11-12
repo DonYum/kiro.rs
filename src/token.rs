@@ -112,23 +112,23 @@ pub(crate) fn count_all_tokens(
     tools: Option<Vec<Tool>>,
 ) -> u64 {
     // 检查是否配置了远程 API
-    if let Some(config) = get_config() {
-        if let Some(api_url) = &config.api_url {
-            // 尝试调用远程 API
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(call_remote_count_tokens(
-                    api_url, config, model, &system, &messages, &tools,
-                ))
-            });
+    if let Some(config) = get_config()
+        && let Some(api_url) = &config.api_url
+    {
+        // 尝试调用远程 API
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(call_remote_count_tokens(
+                api_url, config, model, &system, &messages, &tools,
+            ))
+        });
 
-            match result {
-                Ok(tokens) => {
-                    tracing::debug!("远程 count_tokens API 返回: {}", tokens);
-                    return tokens;
-                }
-                Err(e) => {
-                    tracing::warn!("远程 count_tokens API 调用失败，回退到本地计算: {}", e);
-                }
+        match result {
+            Ok(tokens) => {
+                tracing::debug!("远程 count_tokens API 返回: {}", tokens);
+                return tokens;
+            }
+            Err(e) => {
+                tracing::warn!("远程 count_tokens API 调用失败，回退到本地计算: {}", e);
             }
         }
     }
@@ -143,15 +143,15 @@ async fn call_remote_count_tokens(
     config: &CountTokensConfig,
     model: String,
     system: &Option<Vec<SystemMessage>>,
-    messages: &Vec<Message>,
+    messages: &[Message],
     tools: &Option<Vec<Tool>>,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     let client = build_client(config.proxy.as_ref(), 300, config.tls_backend)?;
 
     // 构建请求体
     let request = CountTokensRequest {
-        model: model, // 模型名称用于 token 计算
-        messages: messages.clone(),
+        model, // 模型名称用于 token 计算
+        messages: messages.to_vec(),
         system: system.clone(),
         tools: tools.clone(),
     };
