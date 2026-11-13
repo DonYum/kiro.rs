@@ -17,6 +17,10 @@ use crate::kiro::provider::MeteringRecorder;
 /// Anthropic `stop_reason`。一经设置即为终态，后续事件不得覆盖。
 pub(super) const REFUSAL_STOP_REASON: &str = "refusal";
 
+/// Placeholder signature used when a thinking block has no authentic upstream
+/// signature. History replay must not send this value back as `reasoningContent`.
+pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kiro-rs-thinking-signature";
+
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
 /// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
@@ -826,16 +830,17 @@ impl StreamContext {
         let mut events = Vec::new();
 
         // signature_delta：优先用上游 reasoning event 真实 signature。
-        // Anthropic 规范要求字段存在，没有就发空串（真实 reasoningContentEvent
-        // 通常带 signature；若未带，下一轮 history 回写该 thinking 块可能被上游拒）。
+        // 没有真实签名时用固定占位符。history 回放会拒绝这个占位符，不会把它
+        // 写回 reasoningContent。
         let signature = match self.pending_reasoning_signature.take() {
             Some(sig) if !sig.is_empty() => sig,
             _ => {
                 tracing::warn!(
                     "reasoning 块关闭时无 signature（上游未在 reasoningContentEvent 中提供），\
-                     使用空串占位。下一轮 history 回写该 thinking 块可能被上游拒。"
+                     使用占位签名 {}。下一轮 history 不会回传该占位符。",
+                    THINKING_SIGNATURE_PLACEHOLDER
                 );
-                String::new()
+                THINKING_SIGNATURE_PLACEHOLDER.to_string()
             }
         };
         if let Some(delta_event) = self.state_manager.handle_content_block_delta(
@@ -1623,6 +1628,35 @@ mod tests {
             sig_pos < stop_pos,
             "signature_delta must precede content_block_stop"
         );
+        assert_eq!(
+            events[sig_pos.unwrap()].data["delta"]["signature"],
+            "the-sig"
+        );
+    }
+
+    #[test]
+    fn missing_reasoning_signature_uses_placeholder() {
+        for signature in [None, Some(String::new())] {
+            let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+            let _ = ctx.generate_initial_events();
+            let mut events =
+                ctx.process_reasoning_content(&crate::kiro::model::events::ReasoningContentEvent {
+                    text: "reasoning".to_string(),
+                    signature,
+                    redacted_content: None,
+                });
+            events.extend(ctx.generate_final_events());
+            let delta = events
+                .iter()
+                .find(|e| {
+                    e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
+                })
+                .expect("signature_delta");
+            assert_eq!(
+                delta.data["delta"]["signature"],
+                THINKING_SIGNATURE_PLACEHOLDER
+            );
+        }
     }
 
     #[test]
