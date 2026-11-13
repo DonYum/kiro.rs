@@ -17,6 +17,10 @@ use crate::kiro::provider::MeteringRecorder;
 /// Anthropic `stop_reason`。一经设置即为终态，后续事件不得覆盖。
 pub(super) const REFUSAL_STOP_REASON: &str = "refusal";
 
+/// Placeholder signature used when a thinking block has no authentic upstream
+/// signature. History replay must not send this value back as `reasoningContent`.
+pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kiro-rs-thinking-signature";
+
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
 /// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。

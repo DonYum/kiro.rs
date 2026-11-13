@@ -7,6 +7,7 @@
 
 use reqwest::Client;
 use reqwest::header::HeaderMap;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -451,6 +452,10 @@ impl KiroProvider {
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut failed_ids: Vec<u64> = Vec::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
+        // Keep the canonical body: endpoint-specific transformations must run again
+        // after stripping history, especially if a later attempt selects another endpoint.
+        let mut effective_body: Cow<'_, str> = Cow::Borrowed(request_body);
+        let mut stripped_reasoning = false;
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
@@ -508,7 +513,7 @@ impl KiroProvider {
             };
 
             let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx);
+            let body = endpoint.transform_api_body(&effective_body, &rctx);
 
             let base = self
                 .client_for(&ctx.credentials)?
@@ -610,6 +615,28 @@ impl KiroProvider {
                         status,
                         body
                     ));
+                    continue;
+                }
+                // Only a recognized history-signature failure can recover by removing
+                // history reasoning. This is not a credential failure and must not
+                // penalize the account. The retry consumes the existing attempt budget.
+                // Empty 2xx retries stay in `retry_on_empty_stream` and are unchanged.
+                if !stripped_reasoning
+                    && attempt + 1 < max_retries
+                    && is_thinking_signature_invalid(&body)
+                    && let Some(stripped_body) = strip_history_reasoning_content(&effective_body)
+                {
+                    effective_body = Cow::Owned(stripped_body);
+                    stripped_reasoning = true;
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ));
+                    tracing::warn!(
+                        "上游拒绝历史思考签名，移除 history reasoningContent 后重试一次"
+                    );
                     continue;
                 }
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
@@ -868,6 +895,40 @@ impl KiroProvider {
     }
 }
 
+/// Match an explicit upstream error code, not arbitrary words in an error message.
+/// A generic invalid signature may refer to authentication and must not mutate history.
+fn is_thinking_signature_invalid(body: &str) -> bool {
+    const CODE: &str = "THINKING_SIGNATURE_INVALID";
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.trim() == CODE;
+    };
+    ["reason", "code", "__type"]
+        .iter()
+        .any(|key| value.get(key).and_then(|v| v.as_str()) == Some(CODE))
+}
+
+/// Remove only native reasoning from history assistant messages. Preserve current
+/// input, effort, tools, routing metadata and all other history fields unchanged.
+fn strip_history_reasoning_content(request_body: &str) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(request_body).ok()?;
+    let history = value
+        .get_mut("conversationState")?
+        .get_mut("history")?
+        .as_array_mut()?;
+    let mut changed = false;
+    for message in history {
+        if let Some(assistant) = message
+            .get_mut("assistantResponseMessage")
+            .and_then(|value| value.as_object_mut())
+        {
+            changed |= assistant.remove("reasoningContent").is_some();
+        }
+    }
+    changed
+        .then(|| serde_json::to_string(&value).ok())
+        .flatten()
+}
+
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
@@ -1105,5 +1166,254 @@ mod tests {
         .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(err.to_string(), "boom");
+    }
+}
+
+#[cfg(test)]
+mod history_reasoning_retry_tests {
+    use super::*;
+    use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+    use axum::{Router, body::Bytes, http::StatusCode};
+    use serde_json::{Value, json};
+
+    fn request_body() -> Value {
+        json!({
+            "conversationState": {
+                "conversationId": "test-reasoning-session",
+                "currentMessage": {"userInputMessage": {"content": "continue", "modelId": "claude-opus-5.5"}},
+                "history": [
+                    {"userInputMessage": {"content": "hello", "reasoningContent": "untouched"}},
+                    {"assistantResponseMessage": {"content": "answer", "toolUses": [{"toolUseId": "tool-1"}], "reasoningContent": {"reasoningText": {"text": "private", "signature": "old"}}}},
+                    {"assistantResponseMessage": {"content": " ", "reasoningContent": {"redactedContent": "sealed"}}}
+                ]
+            },
+            "additionalModelRequestFields": {"output_config": {"effort": "high"}},
+            "profileArn": "original-profile"
+        })
+    }
+
+    #[test]
+    fn detection_requires_explicit_thinking_signature_code() {
+        for body in [
+            r#"{"reason":"THINKING_SIGNATURE_INVALID"}"#,
+            r#"{"code":"THINKING_SIGNATURE_INVALID"}"#,
+            r#"{"__type":"THINKING_SIGNATURE_INVALID"}"#,
+            "THINKING_SIGNATURE_INVALID",
+        ] {
+            assert!(is_thinking_signature_invalid(body), "{body}");
+        }
+        for body in [
+            r#"{"reason":"INVALID_SIGNATURE"}"#,
+            r#"{"message":"Invalid signature while thinking"}"#,
+            r#"{"reason":"NOT_THINKING_SIGNATURE_INVALID"}"#,
+            r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#,
+            r#"{"reason":"CONTENT_FILTERED"}"#,
+            "malformed THINKING_SIGNATURE_INVALID body",
+            "{}",
+        ] {
+            assert!(!is_thinking_signature_invalid(body), "{body}");
+        }
+    }
+
+    #[test]
+    fn stripping_is_history_only_and_idempotent() {
+        let original = request_body();
+        let stripped = strip_history_reasoning_content(&original.to_string()).unwrap();
+        let actual: Value = serde_json::from_str(&stripped).unwrap();
+        let mut expected = original;
+        for index in [1, 2] {
+            expected["conversationState"]["history"][index]["assistantResponseMessage"]
+                .as_object_mut()
+                .unwrap()
+                .remove("reasoningContent");
+        }
+        assert_eq!(actual, expected);
+        assert!(strip_history_reasoning_content(&stripped).is_none());
+    }
+
+    #[test]
+    fn stripping_does_not_retry_when_no_history_reasoning_exists() {
+        for body in [
+            "invalid",
+            "{}",
+            r#"{"conversationState":{"history":[]}}"#,
+            r#"{"conversationState":{"history":[{"userInputMessage":{"reasoningContent":"keep"}}]}}"#,
+        ] {
+            assert!(strip_history_reasoning_content(body).is_none());
+        }
+    }
+
+    struct Endpoint(String);
+    impl KiroEndpoint for Endpoint {
+        fn name(&self) -> &'static str {
+            "signature-test"
+        }
+        fn api_url(&self, _: &RequestContext<'_>) -> String {
+            self.0.clone()
+        }
+        fn mcp_url(&self, _: &RequestContext<'_>) -> String {
+            self.0.clone()
+        }
+        fn decorate_api(
+            &self,
+            request: reqwest::RequestBuilder,
+            _: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            request
+        }
+        fn decorate_mcp(
+            &self,
+            request: reqwest::RequestBuilder,
+            _: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            request
+        }
+        fn transform_api_body(&self, body: &str, _: &RequestContext<'_>) -> String {
+            let mut value: Value = serde_json::from_str(body).unwrap();
+            // Endpoint adaptation must run on the canonical body on every hop.
+            assert!(value.get("endpointTransformed").is_none());
+            value["endpointTransformed"] = json!(true);
+            value.to_string()
+        }
+    }
+
+    async fn execute_case(
+        is_stream: bool,
+        second_success: bool,
+        first_error: &str,
+        include_reasoning: bool,
+    ) -> (bool, Vec<Value>, u32, bool) {
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let recorded = requests.clone();
+        let first_error = first_error.to_owned();
+        let app = Router::new().fallback(move |body: Bytes| {
+            let recorded = recorded.clone();
+            let first_error = first_error.clone();
+            async move {
+                let mut records = recorded.lock();
+                records.push(serde_json::from_slice(&body).unwrap());
+                if records.len() > 1 && second_success {
+                    (StatusCode::OK, "ok".to_string())
+                } else {
+                    (StatusCode::BAD_REQUEST, first_error)
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let credentials = KiroCredentials {
+            id: Some(1),
+            auth_method: Some("api_key".into()),
+            kiro_api_key: Some("ksk_offline_signature_test".into()),
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                vec![credentials],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let before = manager.snapshot().entries.into_iter().next().unwrap();
+        let endpoints = HashMap::from([(
+            "signature-test".to_string(),
+            Arc::new(Endpoint(url)) as Arc<dyn KiroEndpoint>,
+        )]);
+        let provider =
+            KiroProvider::with_proxy(manager.clone(), None, endpoints, "signature-test".into());
+        let mut request = request_body().to_string();
+        if !include_reasoning {
+            request = strip_history_reasoning_content(&request).unwrap();
+        }
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            if is_stream {
+                provider.call_api_stream(&request).await
+            } else {
+                provider.call_api(&request).await
+            }
+        })
+        .await
+        .expect("signature retry must finish within 5s");
+        let success = result.is_ok();
+        drop(result);
+        server.abort();
+        let bodies = requests.lock().clone();
+        let after = manager.snapshot().entries.into_iter().next().unwrap();
+        assert_eq!(
+            after.failure_count, before.failure_count,
+            "signature retry must not penalize the credential"
+        );
+        assert_eq!(after.disabled, before.disabled);
+        (success, bodies, after.failure_count, after.disabled)
+    }
+
+    #[tokio::test]
+    async fn signature_failure_retries_stripped_body_for_both_response_modes() {
+        for stream in [false, true] {
+            let (ok, requests, _, _) = execute_case(
+                stream,
+                true,
+                r#"{"reason":"THINKING_SIGNATURE_INVALID"}"#,
+                true,
+            )
+            .await;
+            assert!(ok);
+            assert_eq!(requests.len(), 2);
+            let expected: Value = serde_json::from_str(
+                &strip_history_reasoning_content(&requests[0].to_string()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(requests[1], expected);
+            assert!(requests[0].to_string().contains("reasoningContent"));
+            assert!(
+                !requests[1]["conversationState"]["history"][1]["assistantResponseMessage"]
+                    .get("reasoningContent")
+                    .is_some()
+            );
+            assert_eq!(
+                requests[1]["conversationState"]["history"][0]["userInputMessage"]["reasoningContent"],
+                "untouched"
+            );
+            assert_eq!(requests[1]["profileArn"], "original-profile");
+            assert_eq!(
+                requests[1]["additionalModelRequestFields"]["output_config"]["effort"],
+                "high"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_signature_failure_is_not_retried_indefinitely() {
+        let (ok, requests, failure_count, disabled) = execute_case(
+            false,
+            false,
+            r#"{"reason":"THINKING_SIGNATURE_INVALID"}"#,
+            true,
+        )
+        .await;
+        assert!(!ok);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(failure_count, 0);
+        assert!(!disabled);
+    }
+
+    #[tokio::test]
+    async fn unrelated_400_and_missing_reasoning_are_not_retried() {
+        for (error, has_reasoning) in [
+            (r#"{"reason":"THINKING_SIGNATURE_INVALID"}"#, false),
+            (r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#, true),
+            (r#"{"message":"Invalid signature while thinking"}"#, true),
+            (r#"{"reason":"CONTENT_FILTERED"}"#, true),
+        ] {
+            let (ok, requests, _, _) = execute_case(false, true, error, has_reasoning).await;
+            assert!(!ok, "{error}");
+            assert_eq!(requests.len(), 1, "{error}");
+        }
     }
 }
