@@ -383,6 +383,7 @@ pub async fn post_messages(
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -1170,6 +1171,7 @@ pub async fn post_messages_cc(
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
